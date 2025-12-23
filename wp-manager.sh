@@ -22,7 +22,7 @@ LISTENER_SCRIPT="$BASE_DIR/tg_listener.sh"
 # 如果是海外机器，保持为空即可
 GH_PROXY="https://ghproxy.net/"
 # 自动更新源
-UPDATE_URL="https://raw.githubusercontent.com/lje02/wp-manager/main/wp-manager.sh"
+UPDATE_URL="https://raw.githubusercontent.com/lje02/docker-web/main/wp-manager.sh"
 
 # 颜色定义
 GREEN='\033[0;32m'
