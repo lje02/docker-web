@@ -1141,8 +1141,49 @@ function rebuild_gateway_action() {
     fi
 }
 
-# [修改点] 卸载时清理 /usr/bin/wp
-function uninstall_cluster() { echo "⚠️ 危险: 输入 DELETE 确认"; read -p "> " c; [ "$c" == "DELETE" ] && (ls "$SITES_DIR"|while read d; do cd "$SITES_DIR/$d" && docker compose down -v; done; cd "$GATEWAY_DIR" && docker compose down -v; docker network rm proxy-net; rm -rf "$BASE_DIR" /usr/bin/wp; echo "已卸载"); }
+function uninstall_cluster() {
+    clear
+    echo -e "${RED}⚠️  高危操作：卸载脚本及所有数据${NC}"
+    echo -e "此操作将执行以下清理："
+    echo -e " 1. 停止并删除所有 Docker 容器 (站点 + 网关)"
+    echo -e " 2. 删除所有数据文件 ($BASE_DIR)"
+    echo -e " 3. 删除快捷指令 (/usr/bin/wp)"
+    echo "------------------------------------------------"
+    echo -e "${YELLOW}请输入 DELETE 确认卸载，输入其他内容取消。${NC}"
+    read -p "> " c
+    
+    if [ "$c" == "DELETE" ]; then
+        echo -e "${YELLOW}>>> 正在停止容器并清理数据...${NC}"
+        
+        # 1. 尝试停止所有站点
+        if [ -d "$SITES_DIR" ]; then
+            ls "$SITES_DIR" | while read d; do 
+                s_path="$SITES_DIR/$d"
+                if [ -d "$s_path" ]; then
+                    cd "$s_path" && docker compose down -v >/dev/null 2>&1
+                fi
+            done
+        fi
+
+        # 2. 停止网关
+        if [ -d "$GATEWAY_DIR" ]; then
+            cd "$GATEWAY_DIR" && docker compose down -v >/dev/null 2>&1
+        fi
+
+        # 3. 清理网络和文件
+        docker network rm proxy-net >/dev/null 2>&1
+        rm -rf "$BASE_DIR"
+        rm -f /usr/bin/wp
+        
+        echo -e "${GREEN}✔ 已彻底卸载。江湖路远，有缘再见！${NC}"
+        
+        # 核心修复：直接结束脚本进程
+        exit 0
+    else
+        echo "❌ 操作已取消"
+        sleep 1
+    fi
+}
 
 # ================= 4. 菜单显示函数 =================
 function show_menu() {
@@ -1153,7 +1194,7 @@ function show_menu() {
     
     echo -e "${YELLOW}[🚀 部署中心]${NC}"
     echo " 1. 部署 WordPress 新站"
-    echo " 2. 部署 反向代理 (聚合/单页)"
+    echo " 2. 部署 反向代理 (聚合/普通/端口)"
     echo " 3. 部署 域名重定向 (301)"
     echo -e " 4. ${GREEN}应用商店 (App Store)${NC}"
     
