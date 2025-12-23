@@ -3,6 +3,7 @@
 # ================= 1. 配置区域 =================
 # 脚本版本号
 VERSION="V9 (快捷方式: wp)"
+DOCKER_COMPOSE_CMD="docker compose"
 
 # 数据存储路径
 BASE_DIR="/home/docker/web"
