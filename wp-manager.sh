@@ -22,7 +22,7 @@ LISTENER_SCRIPT="$BASE_DIR/tg_listener.sh"
 # 如果是海外机器，保持为空即可
 GH_PROXY="https://ghproxy.net/"
 # 自动更新源
-UPDATE_URL="https://raw.githubusercontent.com/lje02/docker-web/main/wp-manager.sh"
+UPDATE_URL="https://raw.githubusercontent.com/lje02/wp-manager/main/wp-manager.sh"
 
 # 颜色定义
 GREEN='\033[0;32m'
@@ -1147,7 +1147,8 @@ function uninstall_cluster() { echo "⚠️ 危险: 输入 DELETE 确认"; read 
 # ================= 4. 菜单显示函数 =================
 function show_menu() {
     clear
-    echo -e "${GREEN}=== Docker Web Manager ($VERSION) ===${NC}"
+    echo -e "${GREEN}=== Docker 应用部署 ($VERSION) ===${NC}"
+    echo -e "${CYAN}===仅供个人使用 快捷键wp===${NC}"
     echo "-----------------------------------------"
     
     echo -e "${YELLOW}[🚀 部署中心]${NC}"
