@@ -2,7 +2,7 @@
 
 # ================= 1. 配置区域 =================
 # 脚本版本号
-VERSION="V9.3.3 (快捷方式: mmp)"
+VERSION="V10.1(快捷方式: mmp)"
 DOCKER_COMPOSE_CMD="docker compose"
 
 # 数据存储路径
@@ -121,8 +121,7 @@ function check_dependencies() {
         fi
     else
         echo -e "${YELLOW}>>> 未检测到 Docker，正在自动安装...${NC}"
-        # 使用阿里云镜像加速 (国内机器必备)
-        if curl -fsSL https://get.docker.com | bash -s docker --mirror Aliyun; then
+        if curl -fsSL https://get.docker.com | bash; then
             systemctl enable docker && systemctl start docker
             write_log "Installed Docker"
             echo -e "${GREEN}✔ Docker 安装成功${NC}"
@@ -289,6 +288,20 @@ while true; do
 done
 EOF
 chmod +x "$LISTENER_SCRIPT"
+}
+
+# === [新增] 强制刷新网关配置 ===
+function reload_gateway_config() {
+    echo -e "${YELLOW}>>> 正在同步网关配置...${NC}"
+    # 1. 稍微等一下，确保新容器的网络已经完全连通
+    sleep 3
+    # 2. 发送重载信号 (不会断开现有连接)
+    if docker ps | grep -q "gateway_proxy"; then
+        docker exec gateway_proxy nginx -s reload >/dev/null 2>&1
+        echo -e "${GREEN}✔ 网关路由表已刷新${NC}"
+    else
+        echo -e "${RED}⚠️  警告: 网关容器未运行，跳过刷新${NC}"
+    fi
 }
 
 # ================= 3. 业务功能函数 =================
@@ -1363,6 +1376,7 @@ function install_remote_app() {
 
     # 4. 启动
     cd "$sdir" && docker compose up -d
+    reload_gateway_config
     write_log "Installed Cloud App ($app_key) on $domain"
     echo -e "${GREEN}✔ $app_name 部署成功！${NC}"
     check_ssl_status "$domain"
@@ -1953,6 +1967,7 @@ EOF
     # 5. 启动容器
     echo -e "${GREEN}>>> 正在启动容器...${NC}"
     $DOCKER_COMPOSE_CMD -f "$sdir/docker-compose.yml" up -d
+    reload_gateway_config
     
     check_ssl_status "$fd"
     write_log "Created site $fd (PHP:$pt DB:$di Redis:$rt)"
@@ -2000,6 +2015,7 @@ networks:
 EOF
 
     cd "$sdir" && docker compose up -d
+    reload_gateway_config
     check_ssl_status "$d"
     write_log "Created proxy $d"
 }
@@ -2018,14 +2034,22 @@ EOF
 }
 
 function create_redirect() { 
-    read -p "Src Domain: " s
-    read -p "Target URL: " t; t=$(normalize_url "$t")
+    read -p "已解析到本机域名: " s
+    read -p "跳转域名 URL: " t; t=$(normalize_url "$t")
     read -p "Email: " e
     sdir="$SITES_DIR/$s"; mkdir -p "$sdir"
     
-    echo "server { listen 80; server_name localhost; location / { return 301 $t\$request_uri; } }" > "$sdir/redirect.conf"
+       # 使用 cat EOF 写入，避免单行 echo 的引号混乱和自动纠错风险
+    cat > "$sdir/redirect.conf" <<EOF
+server {
+    listen 80;
+    server_name localhost;
+    location / {
+        return 301 $t\$request_uri;
+    }
+}
+EOF
     
-    # 修复：改用多行 YAML 格式
     cat > "$sdir/docker-compose.yml" <<EOF
 services:
   redirector:
@@ -2052,6 +2076,7 @@ networks:
 EOF
 
     cd "$sdir" && docker compose up -d
+    reload_gateway_config
     check_ssl_status "$s"
 }
 
@@ -2314,7 +2339,7 @@ function change_domain() {
         fi
         
         # 6. 刷新网关
-        docker exec gateway_proxy nginx -s reload
+        reload_gateway_config
         
         # 7. [新增] 自动申请并检查证书
         echo -e "${YELLOW}>>> 正在自动申请 SSL 证书，请稍候...${NC}"
@@ -2335,19 +2360,14 @@ server { listen 80; server_name localhost; root /var/www/html; index index.php; 
 EOF
 cd "$s" && docker compose restart nginx; echo "OK";; esac; pause_prompt; done; }
 
-# === 核心逻辑：执行单个站点备份 ===
-# 参数: $1 = 域名
+# === [V3.0 通用版] 核心备份逻辑 ===
 function perform_backup_logic() {
     local site_domain=$1
     local s_path="$SITES_DIR/$site_domain"
     
-    if [ ! -d "$s_path" ]; then
-        echo "跳过: $site_domain (目录不存在)"
-        return
-    fi
+    if [ ! -d "$s_path" ]; then echo "跳过: $site_domain"; return; fi
     
     check_rclone
-    # 检查云端配置
     local has_remote=0
     if rclone listremotes 2>/dev/null | grep -q "remote:"; then has_remote=1; fi
 
@@ -2358,113 +2378,140 @@ function perform_backup_logic() {
     echo -e "${CYAN}>>> [Backup] 正在备份: $site_domain${NC}"
     mkdir -p "$temp_dir"
 
-    # 1. 复制配置文件 (所有应用适用)
-    cp "$s_path/docker-compose.yml" "$temp_dir/" 2>/dev/null
-    cp "$s_path/"*.conf "$temp_dir/" 2>/dev/null
-    cp "$s_path/"*.ini "$temp_dir/" 2>/dev/null
-    # 兼容应用商店的数据目录
-    if [ -d "$s_path/data" ]; then cp -r "$s_path/data" "$temp_dir/"; fi
+    # 1. 备份配置文件 (yml, conf, env 等)
+    # 使用 find 排除 data 目录，防止重复备份 (如果 data 很大)
+    find "$s_path" -maxdepth 1 -type f -exec cp {} "$temp_dir/" \;
 
-    # 2. 智能数据库导出 (MySQL/MariaDB)
+    # 2. [通用] 备份本地挂载的 data 目录 (应用商店应用通常用这个)
+    if [ -d "$s_path/data" ]; then
+        echo " - 发现本地数据目录 (data)，正在打包..."
+        # 将 data 目录打包成一个独立文件，方便还原
+        tar czf "$temp_dir/local_data.tar.gz" -C "$s_path" data
+    fi
+
+    # 3. [WP专用] 备份 Docker 卷 (wp-content)
+    app_container=$(docker compose -f "$s_path/docker-compose.yml" ps -q wordpress 2>/dev/null)
+    if [ ! -z "$app_container" ]; then
+        echo " - [WP] 提取 Docker 数据卷..."
+        docker run --rm --volumes-from "$app_container" -v "$temp_dir":/backup alpine tar czf /backup/wp_content.tar.gz -C /var/www/html wp-content 2>/dev/null
+    fi
+
+    # 4. [数据库] 尝试导出 MySQL (如果存在)
     if [ -f "$s_path/docker-compose.yml" ]; then
-        pwd=$(grep "MYSQL_ROOT_PASSWORD" "$s_path/docker-compose.yml" | head -n 1 | awk -F': ' '{print $2}' | tr -d '"' | tr -d "'")
-        if [ ! -z "$pwd" ]; then
-            db_container=$(docker compose -f "$s_path/docker-compose.yml" ps -q db 2>/dev/null)
-            if [ ! -z "$db_container" ]; then
-                echo " - 导出数据库 SQL..."
-                docker exec "$db_container" mysqldump -u root -p"$pwd" --all-databases > "$temp_dir/db.sql" 2>/dev/null
+        pwd=$(grep "MYSQL_ROOT_PASSWORD" "$s_path/docker-compose.yml" | head -n 1 | awk -F': ' '{print $2}' | tr -d '"' | tr -d "'" | tr -d '\r')
+        db_container=$(docker compose -f "$s_path/docker-compose.yml" ps -q db 2>/dev/null)
+        
+        # 只有当找到了密码 且 找到了db容器，才尝试导出
+        if [ ! -z "$db_container" ] && [ ! -z "$pwd" ]; then
+            echo " - [DB] 尝试导出 MySQL..."
+            if docker exec "$db_container" mysqldump -u root -p"$pwd" --all-databases > "$temp_dir/db.sql" 2>/dev/null; then
+                echo -e "   ${GREEN}✔ SQL 导出成功${NC}"
+            else
+                # 失败不报错，因为可能是 Postgres 或其他库，不强制
+                echo -e "   ℹ️  未检测到兼容的 MySQL，跳过 SQL 导出 (可能是 SQLite/PG)"
             fi
         fi
     fi
 
-    # 3. 智能数据卷提取 (针对 WP 的 wp-content)
-    app_container=$(docker compose -f "$s_path/docker-compose.yml" ps -q wordpress 2>/dev/null)
-    if [ ! -z "$app_container" ]; then
-        echo " - 提取 Docker 数据卷 (wp-content)..."
-        docker run --rm --volumes-from "$app_container" -v "$temp_dir":/backup alpine tar czf /backup/wp_content.tar.gz -C /var/www/html wp-content 2>/dev/null
-    fi
-
-    # 4. 打包与存储
-    echo " - 生成压缩包..."
+    # 5. 打包总文件
+    echo " - 生成最终压缩包..."
     cd /tmp && tar czf "$archive_name" "$b_name"
     
     local local_backup_dir="$BASE_DIR/backups"
     mkdir -p "$local_backup_dir"
     mv "/tmp/$archive_name" "$local_backup_dir/"
-    echo -e "${GREEN}✔ 本地备份保存至: $local_backup_dir/$archive_name${NC}"
+    echo -e "${GREEN}✔ 备份完成: $archive_name${NC}"
 
-    # 5. 云端上传
     if [ "$has_remote" -eq 1 ]; then
-        echo -e "${YELLOW} - 正在上传至云端 (remote:wp_backups/)...${NC}"
+        echo -e "${YELLOW} - 上传至云端...${NC}"
         rclone copy "$local_backup_dir/$archive_name" "remote:wp_backups/"
     fi
-    
     rm -rf "$temp_dir"
-    write_log "Backup completed for $site_domain"
 }
 
-# === 核心逻辑：执行还原 ===
-# 参数: $1 = 备份文件路径, $2 = 目标域名
+# === [V3.0 通用版] 核心还原逻辑 ===
 function perform_restore_logic() {
     local backup_file=$1
     local target_domain=$2
     local target_dir="$SITES_DIR/$target_domain"
 
-    if [ ! -f "$backup_file" ]; then echo "错误: 文件不存在 $backup_file"; return; fi
+    if [ ! -f "$backup_file" ]; then echo "错误: 文件不存在"; return; fi
 
-    echo -e "${YELLOW}>>> [Restore] 正在还原到: $target_domain${NC}"
-    echo -e "${RED}⚠️  警告: 目标目录将被清空并覆盖！${NC}"
+    echo -e "${YELLOW}>>> [Restore] 正在还原: $target_domain${NC}"
+    echo -e "${RED}⚠️  警告: 将强制覆盖目标目录并重建容器！${NC}"
+    read -p "确认执行? (yes/no): " confirm
+    if [ "$confirm" != "yes" ]; then return; fi
     
-    # 1. 解压备份
+    # 1. 解压
     local tar_dir=$(tar tf "$backup_file" | head -1 | cut -f1 -d"/")
     tar xzf "$backup_file" -C /tmp
     local restore_path="/tmp/$tar_dir"
 
-    # 2. 清理旧环境
+    # 2. 清理旧环境 (防止密码/配置冲突)
     if [ -d "$target_dir" ]; then
-        echo " - 停止旧容器..."
-        cd "$target_dir" && docker compose down >/dev/null 2>&1
+        echo " - 停止旧服务并清理..."
+        cd "$target_dir" && docker compose down -v >/dev/null 2>&1
         rm -rf "$target_dir"
     fi
     mkdir -p "$target_dir"
 
     # 3. 恢复配置文件
     echo " - 恢复配置文件..."
-    cp -r "$restore_path"/* "$target_dir/" 2>/dev/null
-    
-    # 4. 启动容器 (初始化环境)
+    # 排除 .tar.gz 和 .sql 文件，只复制配置文件
+    find "$restore_path" -maxdepth 1 -type f ! -name "*.tar.gz" ! -name "*.sql" -exec cp {} "$target_dir/" \;
+
+    # 4. [通用] 恢复本地 data 目录 (关键修复点)
+    if [ -f "$restore_path/local_data.tar.gz" ]; then
+        echo " - [通用] 恢复本地数据目录 (data)..."
+        tar xzf "$restore_path/local_data.tar.gz" -C "$target_dir"
+    fi
+
+    # 5. 启动容器 (初始化环境)
     echo " - 启动容器..."
     cd "$target_dir" && docker compose up -d
 
-    # 5. 恢复 WordPress 数据卷 (如果有)
-    if [ -f "$target_dir/wp_content.tar.gz" ]; then
-        echo " - 恢复 Docker 数据卷 (wp-content)..."
-        # 等待容器卷初始化
-        sleep 5
+    # 6. [WP专用] 恢复 Docker 卷
+    if [ -f "$restore_path/wp_content.tar.gz" ]; then
+        echo " - [WP] 恢复 wp-content 卷..."
+        sleep 3
         app_c=$(docker compose ps -q wordpress)
         if [ ! -z "$app_c" ]; then
-            docker run --rm --volumes-from "$app_c" -v "$target_dir":/backup alpine sh -c "tar xzf /backup/wp_content.tar.gz -C /var/www/html"
+            docker run --rm --volumes-from "$app_c" -v "$restore_path":/backup alpine sh -c "tar xzf /backup/wp_content.tar.gz -C /var/www/html"
         fi
-        rm "$target_dir/wp_content.tar.gz"
     fi
 
-    # 6. 导入数据库 (如果有)
-    if [ -f "$target_dir/db.sql" ]; then
-        echo " - 等待数据库启动 (约15秒)..."
-        # 简单等待或循环检测
-        for i in {1..30}; do
-            if docker compose exec -T db mysqladmin ping -h localhost --silent >/dev/null 2>&1; then break; fi
-            echo -n "."
-            sleep 1
-        done
-        echo -e "\n - 导入数据库..."
-        pwd=$(grep MYSQL_ROOT_PASSWORD docker-compose.yml | awk -F': ' '{print $2}' | tr -d '"' | tr -d "'")
-        docker compose exec -T db mysql -u root -p"$pwd" < "db.sql"
+    # 7. [DB] 导入 MySQL (如果存在)
+    if [ -f "$restore_path/db.sql" ]; then
+        echo " - 检测到 SQL 备份，准备导入..."
+        pwd=$(grep "MYSQL_ROOT_PASSWORD" docker-compose.yml | head -n 1 | awk -F': ' '{print $2}' | tr -d '"' | tr -d "'" | tr -d '\r')
+        
+        if [ ! -z "$pwd" ]; then
+            echo -n "   等待数据库就绪"
+            db_ready=0
+            for i in {1..30}; do
+                if docker compose exec -T db mysqladmin ping -h localhost -u root -p"$pwd" --silent >/dev/null 2>&1; then
+                    db_ready=1; break
+                fi
+                echo -n "."; sleep 2
+            done
+            echo ""
+            
+            if [ "$db_ready" -eq 1 ]; then
+                if docker compose exec -T db mysql -u root -p"$pwd" < "$restore_path/db.sql"; then
+                     echo -e "   ${GREEN}✔ 数据库导入成功${NC}"
+                else
+                     echo -e "   ${RED}❌ SQL 导入失败 (版本不兼容?)${NC}"
+                fi
+            fi
+        fi
     fi
+    
+    # 8. 刷新网关
+    if type reload_gateway_config >/dev/null 2>&1; then reload_gateway_config; else docker exec gateway_proxy nginx -s reload >/dev/null 2>&1; fi
 
     rm -rf "$restore_path"
-    echo -e "${GREEN}✔ 还原操作完成${NC}"
-    write_log "Restored $target_domain from $backup_file"
+    echo -e "${GREEN}✔ 还原完成${NC}"
+    write_log "Restored $target_domain"
 }
 
 function backup_restore_ops() { 
@@ -2609,40 +2656,64 @@ function uninstall_cluster() {
     fi
 }
 
-# === 新增功能：网络自动修复 (启动时运行) ===
 function check_and_fix_network() {
-    echo -e "${YELLOW}>>> [自愈] 正在检查网络连通性...${NC}"
-    local test_domain="github.com"
+    echo -e "${YELLOW}>>> [自愈] 正在优化网络连接...${NC}"
     
-    # 1. 检查当前优先级设置
-    if grep -q "^precedence ::ffff:0:0/96  100" /etc/gai.conf 2>/dev/null; then
+    # 1. 定义多个测试目标 (避免单点故障误判)
+    # 包含国内域名以确保在国内服务器上也能正确检测 IPv4
+    local test_targets=("www.baidu.com" "www.google.com" "github.com" "1.1.1.1")
+    local ipv4_ok=0
+    
+    # 2. 检查当前配置状态
+    if grep -q "^precedence ::ffff:0:0/96" /etc/gai.conf 2>/dev/null; then
         echo -e " - 网络偏好: ${GREEN}IPv4 优先 (已配置)${NC}"
         return
     fi
 
-    # 2. 如果未配置，测试默认连接速度 (3秒超时)
-    echo -e " - 网络偏好: ${YELLOW}默认 (正在检测 IPv6 质量...)${NC}"
-    if ! curl -s --connect-timeout 3 "https://$test_domain" >/dev/null; then
-        echo -e "${RED}⚠️  检测到默认连接超时！${NC}"
-        echo -e "${YELLOW}>>> 正在自动切换为 IPv4 优先模式...${NC}"
-        sed -i '/^precedence ::ffff:0:0\/96  100/d' /etc/gai.conf 2>/dev/null
+    # 3. 轮询测试 IPv4 连通性
+    echo -e " - 正在检测 IPv4 通道 (多节点)..."
+    for target in "${test_targets[@]}"; do
+        # -4: 强制IPv4, -I: 仅Head请求(省流量), -m 3: 超时3秒
+        # 兼容 http 和 https
+        if curl -4 -I -s -m 3 "https://$target" >/dev/null 2>&1 || curl -4 -I -s -m 3 "http://$target" >/dev/null 2>&1; then
+            ipv4_ok=1
+            echo -e " - 连接测试 [${CYAN}$target${NC}]: ${GREEN}成功${NC}"
+            break
+        fi
+    done
+
+    if [ "$ipv4_ok" -eq 1 ]; then
+        echo -e "${YELLOW}>>> 检测到 IPv4 可用，正在开启 IPv4 优先 (解决拉取镜像卡顿)...${NC}"
+        
+        # 确保文件存在
+        [ ! -f /etc/gai.conf ] && touch /etc/gai.conf
+        
+        # [核心修复] 使用模糊匹配删除旧配置 (防止因空格不同导致删除失败)
+        sed -i '/^precedence ::ffff:0:0\/96/d' /etc/gai.conf
+        
+        # 写入标准配置
         echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
-        echo -e "${GREEN}✔ 已自动修复网络优先级。${NC}"
+        
+        echo -e "${GREEN}✔ 已设置 IPv4 优先 (Precedence Set)${NC}"
     else
-        echo -e " - 网络质量: ${GREEN}良好${NC}"
+        echo -e "${RED}❌ IPv4 连接检测失败 (所有目标均超时)${NC}"
+        echo -e "${YELLOW}⚠️  警告: 服务器可能仅有 IPv6 网络，或 DNS 配置错误。跳过优化。${NC}"
     fi
 }
 
-# === 新增功能：手动管理协议 (菜单用) ===
+# === 手动管理协议 (修复版) ===
 function net_protocol_manager() {
     while true; do
         clear
         echo -e "${YELLOW}=== 🌐 IPv4/IPv6 协议偏好设置 ===${NC}"
-        if grep -q "^precedence ::ffff:0:0/96  100" /etc/gai.conf 2>/dev/null; then
+        
+        # 检查状态 (使用更宽容的正则)
+        if grep -q "^precedence ::ffff:0:0/96" /etc/gai.conf 2>/dev/null; then
             prio_status="${GREEN}IPv4 优先${NC}"
         else
             prio_status="${YELLOW}默认 (IPv6 优先)${NC}"
         fi
+        
         echo -e "当前状态: $prio_status"
         echo "------------------------------------------------"
         echo " 1. 优先使用 IPv4 (解决拉取慢/连接超时)"
@@ -2653,12 +2724,17 @@ function net_protocol_manager() {
         read -p "请选择: " o
         case $o in
             0) return;;
-            1) sed -i '/^precedence ::ffff:0:0\/96  100/d' /etc/gai.conf 2>/dev/null
+            1) 
+               # 修复: 模糊匹配删除，避免重复
+               [ ! -f /etc/gai.conf ] && touch /etc/gai.conf
+               sed -i '/^precedence ::ffff:0:0\/96/d' /etc/gai.conf
                echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf
                echo -e "${GREEN}✔ 已设置 IPv4 优先${NC}"; pause_prompt;;
-            2) sed -i '/^precedence ::ffff:0:0\/96  100/d' /etc/gai.conf 2>/dev/null
+            2) 
+               sed -i '/^precedence ::ffff:0:0\/96/d' /etc/gai.conf
                echo -e "${GREEN}✔ 已恢复默认${NC}"; pause_prompt;;
-            3) echo "net.ipv6.conf.all.disable_ipv6 = 1" >> /etc/sysctl.conf
+            3) 
+               echo "net.ipv6.conf.all.disable_ipv6 = 1" >> /etc/sysctl.conf
                sysctl -p >/dev/null 2>&1
                echo -e "${GREEN}✔ IPv6 已禁用${NC}"; pause_prompt;;
         esac
