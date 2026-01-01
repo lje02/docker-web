@@ -337,23 +337,33 @@ while true; do
                     reply "\$sender_id" "\$msg"
                     ;;
 
-                "/status")
-                    load=\$(uptime | awk -F'load average:' '{print \$2}' | sed 's/,//g')
-                    mem_used=\$(free -m | awk 'NR==2{print \$3}')
-                    mem_total=\$(free -m | awk 'NR==2{print \$2}')
+                                "/status")
+                    # 1. 获取负载 (使用 xargs 去除前后多余空格)
+                    load=\$(uptime | awk -F'load average:' '{print \$2}' | sed 's/,//g' | xargs)
+                    
+                    # 2. 获取内存 (同时计算百分比，更直观)
+                    mem_info=\$(free -m | awk 'NR==2{printf "%s/%sMB (%.0f%%)", \$3, \$2, \$3/\$2*100}')
+                    
+                    # 3. 获取硬盘
                     disk_usage=\$(df -h / | awk 'NR==2 {print \$5}')
+                    
+                    # 4. 获取容器数量
                     container_running=\$(docker ps -q | wc -l)
                     
-                    msg="📊 <b>系统实时状态</b>\n"
+                    # 5. 获取运行时间 (去掉开头的 "up " 单词)
+                    run_time=\$(uptime -p | sed 's/^up //')
                     
+                    # --- 构建消息 (优化排版) ---
+                    msg="📊 <b>系统实时状态</b>\n"
+                    msg="\${msg}➖➖➖➖➖➖➖➖\n"
                     msg="\${msg}🧠 负载: <code>\$load</code>\n"
-                    msg="\${msg}💾 内存: \${mem_used}MB / \${mem_total}MB\n"
-                    msg="\${msg}💿 硬盘: \$disk_usage 已用\n"
-                    msg="\${msg}🐳 容器: 运行 \$container_running 个\n"
-                    msg="\${msg}⏱ 运行: \$(uptime -p)"
+                    msg="\${msg}💾 内存: <code>\$mem_info</code>\n"
+                    msg="\${msg}💿 硬盘: <code>\$disk_usage Used</code>\n"
+                    msg="\${msg}🐳 容器: <code>\$container_running Running</code>\n"
+                    msg="\${msg}⏱ 运行: <code>\$run_time</code>"
+                    
                     reply "\$sender_id" "\$msg"
                     ;;
-
                 "/reboot_nginx")
                     reply "\$sender_id" "🔄 正在重载 Nginx 网关..."
                     if docker exec gateway_proxy nginx -s reload >/dev/null 2>&1; then
