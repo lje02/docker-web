@@ -345,7 +345,7 @@ while true; do
                     container_running=\$(docker ps -q | wc -l)
                     
                     msg="📊 <b>系统实时状态</b>\n"
-                    msg="\${msg}-----------------------------\n"
+                    msg="\${msg}---\n"
                     msg="\${msg}🧠 负载: <code>\$load</code>\n"
                     msg="\${msg}💾 内存: \${mem_used}MB / \${mem_total}MB\n"
                     msg="\${msg}💿 硬盘: \$disk_usage 已用\n"
@@ -355,7 +355,7 @@ while true; do
                     ;;
 
                 "/reboot_nginx")
-                    reply "\$sender_id" "🔄 正在平滑重载 Nginx 网关..."
+                    reply "\$sender_id" "🔄 正在重载 Nginx 网关..."
                     if docker exec gateway_proxy nginx -s reload >/dev/null 2>&1; then
                         reply "\$sender_id" "✅ 网关配置已刷新"
                     else
