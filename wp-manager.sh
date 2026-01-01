@@ -345,7 +345,7 @@ while true; do
                     container_running=\$(docker ps -q | wc -l)
                     
                     msg="📊 <b>系统实时状态</b>\n"
-                    msg="\${msg}---\n"
+                    
                     msg="\${msg}🧠 负载: <code>\$load</code>\n"
                     msg="\${msg}💾 内存: \${mem_used}MB / \${mem_total}MB\n"
                     msg="\${msg}💿 硬盘: \$disk_usage 已用\n"
