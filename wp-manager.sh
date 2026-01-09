@@ -2,7 +2,7 @@
 
 # ================= 1. 配置区域 =================
 # 脚本版本号
-VERSION="V10.3.3(快捷方式: mmp)"
+VERSION="V10.3.5(快捷方式: mmp)"
 DOCKER_COMPOSE_CMD="docker compose"
 
 # 数据存储路径
@@ -880,6 +880,7 @@ function security_center() {
         echo -e " 9. ${RED}Webshell 查杀与加固${NC} (防木马)"
         echo -e " 10. ${GREEN}宿主机自动安全更新${NC} (防漏洞)"
         echo -e " 11. ${RED}Cloudflare 防火墙白名单${NC} (防源站泄露)"
+        echo -e " 12. ${GREEN}全站 PHP 安全加固${NC} (禁用高危函数)"
         echo "--------------------------"
         echo " 0. 返回主菜单"
         echo "--------------------------"
@@ -897,6 +898,7 @@ function security_center() {
             9) malware_scan;;
             10) enable_auto_updates;;
             11) whitelist_cloudflare_firewall;;
+            12) harden_php_security;;
         esac
     done 
 }
@@ -1481,6 +1483,95 @@ function container_ops() {
     done 
 }
 
+# === [新增] 全站 PHP 安全加固 (批量部署) ===
+function harden_php_security() {
+    echo -e "${RED}=== 🔒 PHP 深度安全加固 (Security Hardening) ===${NC}"
+    echo -e "${YELLOW}此功能将为所有现有 WordPress 站点执行以下操作：${NC}"
+    echo -e "1. 生成 php_security.ini (禁用 exec, system, shell_exec 等高危函数)。"
+    echo -e "2. 修改 docker-compose.yml 挂载该配置。"
+    echo -e "3. 重启站点容器以生效。"
+    echo "------------------------------------------------"
+    echo -e "${RED}注意：某些依赖系统命令的插件(如特定备份/压缩插件)可能会失效。${NC}"
+    read -p "确认执行? (y/n): " confirm
+    if [ "$confirm" != "y" ]; then return; fi
+
+    for d in "$SITES_DIR"/*; do
+        if [ -d "$d" ]; then
+            domain=$(basename "$d")
+            echo -e "\n正在处理: ${CYAN}$domain${NC} ..."
+            
+            # 1. 写入安全配置文件
+            cat > "$d/php_security.ini" <<EOF
+[PHP]
+; === 基础隐藏 ===
+expose_php = Off
+display_errors = Off
+display_startup_errors = Off
+log_errors = On
+
+; === 资源限制 ===
+memory_limit = 512M
+upload_max_filesize = 512M
+post_max_size = 512M
+max_execution_time = 300
+max_input_time = 300
+
+; === 安全核心 ===
+allow_url_fopen = On
+allow_url_include = Off
+session.cookie_httponly = 1
+session.use_only_cookies = 1
+session.cookie_secure = 1
+
+; === 禁用高危函数 (防 Webshell) ===
+disable_functions = passthru,exec,system,chroot,chgrp,chown,shell_exec,proc_get_status,popen,ini_alter,ini_restore,dl,readlink,symlink,popepassthru,stream_socket_server,fsocket,popen
+
+; === 目录锁定 ===
+open_basedir = /var/www/html:/tmp
+EOF
+
+            # 2. 修改 docker-compose.yml 挂载
+            yml_file="$d/docker-compose.yml"
+            need_restart=0
+            
+            # 情况 A: 以前挂载过 uploads.ini (旧版脚本) -> 替换为 php_security.ini
+            if grep -q "uploads.ini" "$yml_file"; then
+                sed -i 's|./uploads.ini:/usr/local/etc/php/conf.d/uploads.ini|./php_security.ini:/usr/local/etc/php/conf.d/security.ini|g' "$yml_file"
+                echo -e "  - [配置] 已替换旧版 uploads.ini"
+                need_restart=1
+            
+            # 情况 B: 以前挂载过 php_security.ini (已经是新版) -> 只更新了文件内容
+            elif grep -q "php_security.ini" "$yml_file"; then
+                echo -e "  - [配置] 配置文件内容已更新"
+                need_restart=1
+                
+            # 情况 C: 从未挂载过任何 ini -> 插入新挂载
+            else
+                # 备份
+                cp "$yml_file" "$yml_file.bak"
+                # 在 volumes: 下寻找 wp_data 行，在下面插入
+                # 如果找不到 wp_data 锚点，尝试直接在 volumes: 下插入
+                if grep -q "wp_data:/var/www/html" "$yml_file"; then
+                    sed -i '/wp_data:\/var\/www\/html/a \      - ./php_security.ini:/usr/local/etc/php/conf.d/security.ini' "$yml_file"
+                    echo -e "  - [配置] 已添加挂载规则"
+                    need_restart=1
+                else
+                    echo -e "  - ${RED}[错误] 无法定位挂载点，请手动检查 $yml_file${NC}"
+                fi
+            fi
+
+            # 3. 重启容器
+            if [ "$need_restart" -eq 1 ]; then
+                echo -e "  - [重启] 正在应用更改..."
+                cd "$d" && docker compose up -d
+                echo -e "  - ${GREEN}✔ 完成${NC}"
+            fi
+        fi
+    done
+    echo -e "\n${GREEN}✔ 所有站点 PHP 加固完成。${NC}"
+    pause_prompt
+}
+
 function component_manager() { 
     while true; do 
         clear
@@ -1867,6 +1958,12 @@ function waf_manager() {
 # ==================================================
 #   V10.3 Ultimate WAF Rules (Site Level)
 # ==================================================
+# 1. 禁用非法 HTTP 方法 (只允许标准方法)
+if (\$request_method !~ ^(GET|POST|HEAD)$ ) { return 405; }
+
+# 2. 禁止空 User-Agent 或异常 UA
+if (\$http_user_agent = "") { return 403; }
+if (\$http_user_agent ~* "WinHttp|WebZIP|Fetch") { return 403; }
 
 # --- [1] 系统与敏感文件保护 ---
 location ~* \.(engine|inc|info|install|make|module|profile|test|po|sh|.*sql|theme|tpl(\.php)?|xtmpl)$ { return 403; }
@@ -2451,7 +2548,9 @@ function init_gateway() {
     echo "proxy_read_timeout 600s;" >> upload_size.conf
     echo "proxy_send_timeout 600s;" >> upload_size.conf
     echo "server_tokens off;" >> upload_size.conf
-    
+    echo "large_client_header_buffers 4 16k;" >> upload_size.conf
+    echo "client_header_buffer_size 4k;" >> upload_size.conf
+    echo "client_body_buffer_size 128k;" >> upload_size.conf
     # 4. 生成 Docker Compose (已修复 Logging 格式)
     cat > docker-compose.yml <<EOF
 services:
@@ -2641,17 +2740,42 @@ server {
 }
 EOF
 
-    # 3. 生成 PHP 上传限制配置
-    cat > "$sdir/uploads.ini" <<EOF
-file_uploads = On
-memory_limit = 512M
-upload_max_filesize = 512M
-post_max_size = 512M
-max_execution_time = 600
+     # 3. 生成 PHP 安全加固配置
+    cat > "$sdir/php_security.ini" <<EOF
+[PHP]
+; === 基础安全 ===
 expose_php = Off
+display_errors = Off
+display_startup_errors = Off
+log_errors = On
+error_log = /var/log/php_errors.log
+
+; === 资源限制 (防DoS) ===
+memory_limit = 512M
+max_execution_time = 300
+max_input_time = 300
+post_max_size = 512M
+upload_max_filesize = 512M
+max_file_uploads = 20
+
+; === 远程包含防御 (防RFI) ===
+allow_url_fopen = On
+allow_url_include = Off
+
+; === 会话安全 ===
+session.cookie_httponly = 1
+session.use_only_cookies = 1
+session.cookie_secure = 1
+
+; === 核心函数禁用 (废掉 Webshell) ===
+; 已修复拼写错误: popepassthru -> fpassthru
+disable_functions = passthru,exec,system,chroot,chgrp,chown,shell_exec,proc_get_status,popen,ini_alter,ini_restore,dl,readlink,symlink,fpassthru,stream_socket_server,fsocket
+
+; === 目录锁定 (防跨站/读系统文件) ===
+open_basedir = /var/www/html:/tmp
 EOF
 
-    # 4. 生成 Docker Compose (已修复 Logging 和 环境变量)
+          # 4. 生成 Docker Compose (完整版：修复了变量转义、YAML格式、Nginx配置)
     cat > "$sdir/docker-compose.yml" <<EOF
 services:
   db:
@@ -2715,7 +2839,7 @@ services:
         }
     volumes:
       - wp_data:/var/www/html
-      - ./uploads.ini:/usr/local/etc/php/conf.d/uploads.ini
+      - ./php_security.ini:/usr/local/etc/php/conf.d/security.ini
     networks:
       - default
 
