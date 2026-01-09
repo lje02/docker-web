@@ -2,7 +2,7 @@
 
 # ================= 1. 配置区域 =================
 # 脚本版本号
-VERSION="V10.1(快捷方式: mmp)"
+VERSION="V10.3.3(快捷方式: mmp)"
 DOCKER_COMPOSE_CMD="docker compose"
 
 # 数据存储路径
@@ -337,35 +337,25 @@ while true; do
                     reply "\$sender_id" "\$msg"
                     ;;
 
-                                "/status")
-                    # 1. 获取负载 (使用 xargs 去除前后多余空格)
-                    load=\$(uptime | awk -F'load average:' '{print \$2}' | sed 's/,//g' | xargs)
-                    
-                    # 2. 获取内存 (同时计算百分比，更直观)
-                    mem_info=\$(free -m | awk 'NR==2{printf "%s/%sMB (%.0f%%)", \$3, \$2, \$3/\$2*100}')
-                    
-                    # 3. 获取硬盘
+                "/status")
+                    load=\$(uptime | awk -F'load average:' '{print \$2}' | sed 's/,//g')
+                    mem_used=\$(free -m | awk 'NR==2{print \$3}')
+                    mem_total=\$(free -m | awk 'NR==2{print \$2}')
                     disk_usage=\$(df -h / | awk 'NR==2 {print \$5}')
-                    
-                    # 4. 获取容器数量
                     container_running=\$(docker ps -q | wc -l)
                     
-                    # 5. 获取运行时间 (去掉开头的 "up " 单词)
-                    run_time=\$(uptime -p | sed 's/^up //')
-                    
-                    # --- 构建消息 (优化排版) ---
                     msg="📊 <b>系统实时状态</b>\n"
-                    msg="\${msg}➖➖➖➖➖➖➖➖\n"
+                    msg="\${msg}-----------------------------\n"
                     msg="\${msg}🧠 负载: <code>\$load</code>\n"
-                    msg="\${msg}💾 内存: <code>\$mem_info</code>\n"
-                    msg="\${msg}💿 硬盘: <code>\$disk_usage Used</code>\n"
-                    msg="\${msg}🐳 容器: <code>\$container_running Running</code>\n"
-                    msg="\${msg}⏱ 运行: <code>\$run_time</code>"
-                    
+                    msg="\${msg}💾 内存: \${mem_used}MB / \${mem_total}MB\n"
+                    msg="\${msg}💿 硬盘: \$disk_usage 已用\n"
+                    msg="\${msg}🐳 容器: 运行 \$container_running 个\n"
+                    msg="\${msg}⏱ 运行: \$(uptime -p)"
                     reply "\$sender_id" "\$msg"
                     ;;
+
                 "/reboot_nginx")
-                    reply "\$sender_id" "🔄 正在重载 Nginx 网关..."
+                    reply "\$sender_id" "🔄 正在平滑重载 Nginx 网关..."
                     if docker exec gateway_proxy nginx -s reload >/dev/null 2>&1; then
                         reply "\$sender_id" "✅ 网关配置已刷新"
                     else
@@ -411,15 +401,32 @@ EOF
 chmod +x "$LISTENER_SCRIPT"
 }
 
-# === [新增] 强制刷新网关配置 ===
+# === [修复版] 强制刷新网关配置 (带延迟等待) ===
 function reload_gateway_config() {
     echo -e "${YELLOW}>>> 正在同步网关配置...${NC}"
-    # 1. 稍微等一下，确保新容器的网络已经完全连通
-    sleep 3
-    # 2. 发送重载信号 (不会断开现有连接)
+    
+    # 1. 【核心修复】强制等待 5 秒
+    # 让新启动的容器有足够的时间完成网络注册和 IP 分配
+    # 否则网关重启太快，会读不到新容器的 IP，导致 502 或 404
+    echo -n "   等待新容器网络就绪 (5秒)..."
+    for i in {1..5}; do 
+        echo -n "."
+        sleep 1
+    done
+    echo ""
+
     if docker ps | grep -q "gateway_proxy"; then
-        docker exec gateway_proxy nginx -s reload >/dev/null 2>&1
-        echo -e "${GREEN}✔ 网关路由表已刷新${NC}"
+        # 2. 强制重启网关
+        # Restart 比 reload 更彻底，它会强制 nginx-proxy 重新扫描整个 Docker 网络
+        docker restart gateway_proxy >/dev/null 2>&1
+        
+        # 3. 连带重启 ACME
+        # 网关重启后，ACME 容器有时会断开 Socket 连接，顺手重启它最稳妥
+        if docker ps | grep -q "gateway_acme"; then
+             docker restart gateway_acme >/dev/null 2>&1
+        fi
+        
+        echo -e "${GREEN}✔ 网关已重启，新站点路由已生效${NC}"
     else
         echo -e "${RED}⚠️  警告: 网关容器未运行，跳过刷新${NC}"
     fi
@@ -427,120 +434,433 @@ function reload_gateway_config() {
 
 # ================= 3. 业务功能函数 =================
 
-# [V9] 主机安全审计
+# === [V9.5 升级版] 主机深度审计与隐藏进程猎杀 ===
 function server_audit() {
-    check_dependencies # 确保有 netstat
+    # 内部函数：安装 Unhide
+    function install_unhide() {
+        if ! command -v unhide >/dev/null 2>&1; then
+            echo -e "${YELLOW}>>> 正在安装 Unhide (隐藏进程扫描神器)...${NC}"
+            if [ -f /etc/debian_version ]; then
+                apt-get update && apt-get install -y unhide
+            else
+                yum install -y unhide
+            fi
+        fi
+    }
+
     while true; do
-        clear; echo -e "${YELLOW}=== 🕵️ 主机安全审计 (V9) ===${NC}"
-        
-        echo -e "${CYAN}[1] 端口暴露审计${NC}"
-        echo -e "    检查服务器当前对外开放的端口，防止误开高危端口。"
-        
-        echo -e "${CYAN}[2] 恶意进程/挖矿检测${NC}"
-        echo -e "    检查高 CPU 占用进程、可疑目录(/tmp)运行的程序。"
-        
+        clear; echo -e "${RED}=== 🕵️ 主机深度审计 (Hunter Mode) ===${NC}"
+        echo -e "${YELLOW}此模块用于检测 Rootkit、挖矿病毒及隐藏进程。${NC}"
         echo "--------------------------"
-        echo " 1. 扫描当前开放端口 (TCP/UDP)"
-        echo " 2. 执行 恶意进程与挖矿 快速扫描"
-        echo " 3. 查看最近登录记录 (last)"
-        echo " 0. 返回上一级"
+        echo -e " 1. 端口与连接审计 (Netstat)"
+        echo -e " 2. ${CYAN}幽灵进程检测 (对比 /proc vs ps)${NC}"
+        echo -e " 3. ${RED}暴力枚举隐藏进程 (Unhide - 内核级查杀)${NC}"
+        echo -e " 4. 恶意进程与文件扫描 (CPU/Temp)"
+        echo -e " 5. 检查系统预加载劫持 (LD_PRELOAD)"
+        echo " 0. 返回"
         echo "--------------------------"
-        read -p "请输入选项 [0-3]: " o
+        read -p "请输入选项 [0-5]: " o
         case $o in
             0) return;;
+            
             1) 
                 echo -e "\n${GREEN}>>> 正在扫描监听端口...${NC}"
-                echo -e "${YELLOW}注意: 0.0.0.0 或 ::: 表示对全网开放${NC}"
+                check_dependencies # 确保 netstat 存在
                 echo "--------------------------------------------------------"
                 printf "%-8s %-25s %-15s %-20s\n" "协议" "本地地址:端口" "状态" "进程PID/名称"
                 echo "--------------------------------------------------------"
-                if command -v netstat >/dev/null; then
-                    netstat -tunlp | grep LISTEN | awk '{printf "%-8s %-25s %-15s %-20s\n", $1, $4, $6, $7}'
-                else
-                    ss -tunlp | grep LISTEN | awk '{printf "%-8s %-25s %-15s %-20s\n", $1, $5, $2, $7}'
-                fi
+                netstat -tunlp | grep LISTEN | awk '{printf "%-8s %-25s %-15s %-20s\n", $1, $4, $6, $7}'
                 echo "--------------------------------------------------------"
-                echo "常见高危端口: 3306(MySQL), 6379(Redis), 22(SSH - 如有弱密码)"
-                echo -e "\n${YELLOW}>>> 正在深度检测数据库风险...${NC}"
-    
-    # 检查所有容器，看是否有绑定到 0.0.0.0 的 3306/6379/5432 端口
-    risky_ports=$(docker ps --format "{{.Names}} {{.Ports}}" | grep -E "0.0.0.0:(3306|6379|5432|27017)")
-    
-    if [ ! -z "$risky_ports" ]; then
-                echo -e "${RED}🚨 严重警告！发现数据库端口直接暴露在公网：${NC}"
-                echo "$risky_ports"
-                echo -e "${YELLOW}建议立即修改 docker-compose.yml，移除 'ports' 映射，或改为 '127.0.0.1:3306:3306'${NC}"
-    else
-                echo -e "${GREEN}✔ 数据库端口安全（未检测到公网暴露）${NC}"
-    fi
+                echo -e "${YELLOW}提示: 如果发现没有 PID 的端口 (显示为 -)，说明该进程可能已隐藏！${NC}"
                 pause_prompt;;
+
             2)
-                echo -e "\n${GREEN}>>> 正在执行安全扫描...${NC}"
+                echo -e "\n${GREEN}>>> 正在执行幽灵进程检测...${NC}"
+                echo -e "原理: 对比 '/proc/PID' 目录与 'ps' 命令的输出差异。"
+                echo "--------------------------------------------------------"
                 
-                # 1. 检查 CPU 占用 Top 5
-                echo -e "\n${CYAN}[Check 1] CPU 占用最高的 5 个进程:${NC}"
+                # 获取所有 /proc 下的数字目录 (真实的进程)
+                ls -d /proc/[0-9]* | cut -d/ -f3 | sort -n > /tmp/procs_raw.txt
+                # 获取 ps 命令能看到的进程
+                ps -e -o pid= | tr -d ' ' | sort -n > /tmp/procs_ps.txt
+                
+                # 对比差异
+                hidden_pids=$(comm -23 /tmp/procs_raw.txt /tmp/procs_ps.txt)
+                
+                if [ ! -z "$hidden_pids" ]; then
+                    echo -e "${RED}🚨 警告！发现 'ps' 命令看不到的幽灵进程：${NC}"
+                    for pid in $hidden_pids; do
+                        # 过滤掉极短命进程（可能刚才运行完就结束了）
+                        if [ -d "/proc/$pid" ]; then
+                            cmdline=$(cat /proc/$pid/cmdline 2>/dev/null | tr '\0' ' ')
+                            echo -e "PID: ${RED}$pid${NC} | Cmd: $cmdline"
+                        fi
+                    done
+                else
+                    echo -e "${GREEN}✔ 未发现用户态隐藏进程 (ps命令未被篡改)${NC}"
+                fi
+                rm -f /tmp/procs_raw.txt /tmp/procs_ps.txt
+                pause_prompt;;
+                
+            3)
+                echo -e "\n${RED}>>> 正在启动 Unhide 暴力猎杀模式...${NC}"
+                install_unhide
+                if command -v unhide >/dev/null 2>&1; then
+                    echo -e "${YELLOW}正在暴力轮询 PID (可能需要几十秒)...${NC}"
+                    # 使用 brute 和 proc 混合模式
+                    unhide proc
+                    echo "----------------------------------------"
+                    unhide sys
+                    echo "----------------------------------------"
+                    echo -e "${CYAN}如果上面列出了 PID，请立即使用 'kill -9 PID' 尝试杀掉。${NC}"
+                    echo -e "如果杀不掉，说明可能已深入内核模块，建议重装系统。"
+                else
+                    echo -e "${RED}❌ Unhide 安装失败，无法执行。${NC}"
+                fi
+                pause_prompt;;
+            
+            4)
+                echo -e "\n${GREEN}>>> 正在执行常规恶意扫描...${NC}"
+                # CPU Top 5
+                echo -e "\n${CYAN}[1] CPU 占用最高的 5 个进程:${NC}"
                 ps -eo pid,ppid,cmd,%mem,%cpu --sort=-%cpu | head -n 6
                 
-                # 2. 检查可疑目录 (/tmp, /var/tmp, /dev/shm) 下的可执行文件
-                echo -e "\n${CYAN}[Check 2] 检查可疑目录运行的进程 (/tmp, /dev/shm):${NC}"
+                # 检查可疑目录
+                echo -e "\n${CYAN}[2] 检查可疑目录运行的进程 (/tmp, /dev/shm):${NC}"
                 suspicious_found=0
-                # 遍历 /proc 下所有的 pid
                 for pid in $(ls /proc | grep -E '^[0-9]+$'); do
                     if [ -d "/proc/$pid" ]; then
                         exe_link=$(readlink -f /proc/$pid/exe 2>/dev/null)
                         if [[ "$exe_link" == /tmp/* ]] || [[ "$exe_link" == /var/tmp/* ]] || [[ "$exe_link" == /dev/shm/* ]]; then
                             echo -e "${RED}⚠️  发现可疑进程 PID: $pid${NC}"
                             echo -e "   路径: $exe_link"
-                            echo -e "   命令: $(cat /proc/$pid/cmdline 2>/dev/null)"
                             suspicious_found=1
                         fi
                     fi
                 done
-                if [ "$suspicious_found" -eq 0 ]; then echo -e "${GREEN}✔ 未发现明显的可疑目录进程${NC}"; fi
+                [ "$suspicious_found" -eq 0 ] && echo -e "${GREEN}✔ 暂无发现${NC}"
                 
-                # 3. 检查文件被删除但仍在运行的进程 (Deleted binary)
-                echo -e "\n${CYAN}[Check 3] 检查已删除但仍在运行的二进制文件:${NC}"
-                deleted_found=0
-                ls -l /proc/*/exe 2>/dev/null | grep '(deleted)' | grep -v "docker" | grep -v "containerd" | while read line; do
-                    echo -e "${YELLOW}⚠️  $line${NC}"
-                    deleted_found=1
-                done
-                
-                echo -e "\n--------------------------"
-                echo -e "提示: 如果发现名为 xmrig, kinsing, masscan 等进程，通常为病毒。"
+                # 检查已删除但仍在运行
+                echo -e "\n${CYAN}[3] 检查已删除但仍在运行的二进制文件:${NC}"
+                ls -l /proc/*/exe 2>/dev/null | grep '(deleted)' | grep -vE "docker|containerd|runc"
                 pause_prompt;;
-            3) last | head -n 10; pause_prompt;;
+                
+            5)
+                echo -e "\n${YELLOW}>>> 检查 LD_PRELOAD 劫持...${NC}"
+                echo "Rootkit 常通过环境变量劫持系统函数。"
+                if [ ! -z "$LD_PRELOAD" ] || grep -q "LD_PRELOAD" /etc/ld.so.preload 2>/dev/null; then
+                     echo -e "${RED}🚨 严重警告！检测到 LD_PRELOAD 设置！${NC}"
+                     echo "环境变量: $LD_PRELOAD"
+                     echo "配置文件: $(cat /etc/ld.so.preload 2>/dev/null)"
+                     echo -e "如果这不是你配置的，请立即检查！"
+                else
+                     echo -e "${GREEN}✔ 未检测到 LD_PRELOAD 劫持。${NC}"
+                fi
+                pause_prompt;;
+        esac
+    done
+}
+
+# === [修复版] Cloudflare Real IP 修复 ===
+function fix_cloudflare_ip() {
+    echo -e "${YELLOW}>>> 正在配置 Cloudflare 真实 IP 透传...${NC}"
+    
+    local cf_conf="$GATEWAY_DIR/cloudflare.conf"
+    local yml_file="$GATEWAY_DIR/docker-compose.yml"
+    
+    # 1. 生成配置文件
+    echo "# Cloudflare IP Ranges" > "$cf_conf"
+    echo "real_ip_header CF-Connecting-IP;" >> "$cf_conf"
+    echo -e "正在下载 Cloudflare IP 列表..."
+    curl -s https://www.cloudflare.com/ips-v4 | sed 's/^/set_real_ip_from /; s/$/;/' >> "$cf_conf"
+    curl -s https://www.cloudflare.com/ips-v6 | sed 's/^/set_real_ip_from /; s/$/;/' >> "$cf_conf"
+    
+    # 2. 精准挂载 (修复 YAML 格式错误)
+    if ! grep -q "cloudflare.conf" "$yml_file"; then
+        echo -e "${YELLOW}正在修改 docker-compose.yml...${NC}"
+        
+        # 备份原文件
+        cp "$yml_file" "$yml_file.bak"
+        
+        # 逻辑：寻找 "conf:/etc/nginx/conf.d" 这一行（这是网关肯定有的），在它下面插入新行
+        # 这样能保证缩进和位置绝对正确
+        sed -i '\|conf:/etc/nginx/conf.d|a \      - ./cloudflare.conf:/etc/nginx/conf.d/cloudflare.conf:ro' "$yml_file"
+        
+        echo -e "${GREEN}✔ 挂载配置已注入${NC}"
+        
+        # 3. 验证并重启
+        # 先尝试 config 检查，如果报错则还原
+        if ! docker compose -f "$yml_file" config >/dev/null 2>&1; then
+             echo -e "${RED}❌ YAML 语法校验失败，正在回滚...${NC}"
+             mv "$yml_file.bak" "$yml_file"
+             echo -e "请尝试手动编辑 $yml_file 添加挂载。"
+        else
+             rm "$yml_file.bak"
+             reload_gateway_config
+        fi
+    else
+        docker exec gateway_proxy nginx -s reload
+        echo -e "${GREEN}✔ 配置已更新并重载${NC}"
+    fi
+    
+    pause_prompt
+}
+
+# === [增强版] Webshell 恶意文件查杀 (带清理功能) ===
+function malware_scan() {
+    while true; do
+        clear
+        echo -e "${RED}=== 🦠 Webshell 深度查杀 (Iron Wall) ===${NC}"
+        echo -e "${YELLOW}提示: 自动删除仅针对 uploads 目录的高危文件，其他目录仅报警。${NC}"
+        echo "------------------------------------------------"
+        echo " 1. 快速扫描 & 清理 (检查 uploads 目录下的 PHP 文件)"
+        echo " 2. 深度扫描 (检查 eval/base64 等危险函数 - 仅报告)"
+        echo " 3. 权限加固 (锁定 uploads 目录禁止执行 PHP)"
+        echo " 0. 返回"
+        echo "------------------------------------------------"
+        read -p "请选择: " o
+        
+        case $o in
+            0) return;;
+            1)
+                echo -e "${YELLOW}>>> 正在扫描 uploads 目录下的非法 PHP 文件...${NC}"
+                echo -e "原理: WordPress 的 uploads 目录只应存放图片/附件，绝不该有 PHP 脚本。"
+                echo "------------------------------------------------"
+                
+                # 定义一个临时文件存放扫描结果
+                tmp_list="/tmp/malware_list.txt"
+                > "$tmp_list"
+
+                # 扫描所有站点的 uploads 目录
+                find "$SITES_DIR" -type d -name "uploads" | while read dir; do
+                    # 查找该目录下的 php 文件
+                    find "$dir" -name "*.php" >> "$tmp_list"
+                done
+
+                if [ ! -s "$tmp_list" ]; then
+                    echo -e "${GREEN}✔ 恭喜！未发现明显的 uploads 目录木马。${NC}"
+                else
+                    echo -e "${RED}🚨 发现以下高危文件：${NC}"
+                    cat -n "$tmp_list"
+                    echo "------------------------------------------------"
+                    
+                    # 交互式清理逻辑
+                    echo -e "${YELLOW}这些文件极大概率是 Webshell 木马。${NC}"
+                    read -p "是否进入交互式清理模式? (y/n): " confirm
+                    if [ "$confirm" == "y" ]; then
+                        # 逐行读取文件进行处理
+                        while read file_path; do
+                            echo -e "\n文件: ${CYAN}$file_path${NC}"
+                            echo -e "内容预览: $(head -n 1 "$file_path" | cut -c 1-50)..."
+                            read -p "👉 确认删除此文件? (y=删除, n=跳过): " del_opt
+                            if [ "$del_opt" == "y" ]; then
+                                rm -f "$file_path"
+                                echo -e "${GREEN}已删除。${NC}"
+                            else
+                                echo "已跳过。"
+                            fi
+                        done < "$tmp_list"
+                    else
+                        echo "操作已取消，请手动处理。"
+                    fi
+                fi
+                rm -f "$tmp_list"
+                pause_prompt;;
+            
+            2)
+                echo -e "${YELLOW}>>> 正在执行特征码扫描...${NC}"
+                echo "此模式仅报告文件路径和行号，请手动核实（存在误报可能）。"
+                echo "------------------------------------------------"
+                # 排除日志、图片、缓存目录
+                grep -r --include="*.php" \
+                     --exclude-dir="node_modules" \
+                     --exclude-dir="vendor" \
+                     --exclude-dir="cache" \
+                     --exclude-dir="logs" \
+                     -E "eval\(|assert\(|base64_decode\('|shell_exec\(|passthru\(" "$SITES_DIR" | cut -c 1-120
+                echo "------------------------------------------------"
+                echo -e "${CYAN}分析指南：${NC}"
+                echo -e "1. ${GREEN}eval(\$_POST[...]);${NC} -> 100% 木马，立即删除。"
+                echo -e "2. ${GREEN}base64_decode('...');${NC} -> 检查解码内容，可能是加密的木马。"
+                echo -e "3. 如果出现在正常插件(plugins)目录，可能是误报，请谨慎。"
+                pause_prompt;;
+                
+            3)
+                echo -e "${YELLOW}>>> 正在生成 uploads 目录防执行配置...${NC}"
+                # 为每个站点生成禁止 uploads 运行 php 的配置
+                for dir in "$SITES_DIR"/*; do
+                    if [ -d "$dir" ]; then
+                        conf_file="$dir/waf_uploads.conf"
+                        # 增强版配置：禁止 php 执行
+                        cat > "$conf_file" <<EOF
+location ~* ^/wp-content/uploads/.*\.php$ {
+    deny all;
+}
+EOF
+                        # 注入到 nginx.conf
+                        if [ -f "$dir/nginx.conf" ] && ! grep -q "waf_uploads.conf" "$dir/nginx.conf"; then
+                            sed -i '/include \/etc\/nginx\/waf.conf;/a \    include /etc/nginx/waf_uploads.conf;' "$dir/nginx.conf"
+                             # 挂载
+                            if ! grep -q "waf_uploads.conf" "$dir/docker-compose.yml"; then
+                                 sed -i '/waf.conf:\/etc\/nginx\/waf.conf/a \      - ./waf_uploads.conf:/etc/nginx/waf_uploads.conf' "$dir/docker-compose.yml"
+                                 cd "$dir" && docker compose up -d
+                            fi
+                            echo -e " - $(basename "$dir"): ${GREEN}已加固${NC}"
+                        fi
+                    fi
+                done
+                reload_gateway_config
+                echo -e "${GREEN}✔ 所有站点的上传目录已锁定，即便上传了木马也无法运行。${NC}"
+                pause_prompt;;
+        esac
+    done
+}
+
+# === [增强] 宿主机自动安全更新 ===
+function enable_auto_updates() {
+    echo -e "${YELLOW}>>> 正在配置操作系统自动安全更新...${NC}"
+    
+    if command -v apt-get >/dev/null; then
+        apt-get update
+        apt-get install -y unattended-upgrades
+        
+        # 启用自动更新
+        echo "unattended-upgrades unattended-upgrades/enable_auto_updates boolean true" | debconf-set-selections
+        dpkg-reconfigure -f noninteractive unattended-upgrades
+        
+        echo -e "${GREEN}✔ 已启用: 每天自动安装安全补丁 (Security Updates)${NC}"
+        echo -e "这能有效防止内核级漏洞逃逸。"
+    else
+        echo -e "${RED}❌ 当前系统不支持 (仅支持 Debian/Ubuntu)${NC}"
+    fi
+    pause_prompt
+}
+
+# === [新增] Cloudflare防火墙白名单 (只允许CF访问) ===
+function whitelist_cloudflare_firewall() {
+    # 检测防火墙类型
+    if command -v ufw >/dev/null; then FW_TYPE="UFW";
+    elif command -v firewall-cmd >/dev/null; then FW_TYPE="FIREWALLD";
+    else echo -e "${RED}❌ 未检测到 UFW 或 Firewalld，无法配置。${NC}"; pause_prompt; return; fi
+
+    while true; do
+        clear
+        echo -e "${RED}=== 🧱 Cloudflare 专属白名单 (Source IP Lock) ===${NC}"
+        echo -e "防火墙类型: $FW_TYPE"
+        echo -e "------------------------------------------------"
+        echo -e "${YELLOW}功能说明：${NC}"
+        echo -e "此功能将删除 80/443 的【全网允许】规则，并添加【Cloudflare IP】允许规则。"
+        echo -e "生效后，只有经过 Cloudflare 代理的流量才能访问你的网站。"
+        echo -e "扫描器、直接通过 IP 访问的黑客将被防火墙直接丢弃包。"
+        echo -e "------------------------------------------------"
+        echo -e " 1. ${GREEN}开启白名单限制 (Lock Down)${NC}"
+        echo -e " 2. 关闭限制 (恢复全网访问)"
+        echo -e " 0. 返回"
+        echo -e "------------------------------------------------"
+        read -p "请选择: " o
+        
+        case $o in
+            0) return;;
+            
+            1)
+                echo -e "${RED}⚠️  高危操作确认${NC}"
+                echo -e "1. 请确保你的域名在 CF 后台已开启【小云朵 (Proxied)】，否则网站将无法访问！"
+                echo -e "2. 脚本会自动放行 SSH (22端口)，防止失联。"
+                read -p "我确认已开启小云朵代理 (yes/no): " confirm
+                if [ "$confirm" != "yes" ]; then continue; fi
+
+                echo -e "${YELLOW}>>> 正在获取 Cloudflare 最新 IP 列表...${NC}"
+                cf_ipv4=$(curl -s https://www.cloudflare.com/ips-v4)
+                cf_ipv6=$(curl -s https://www.cloudflare.com/ips-v6)
+
+                if [ -z "$cf_ipv4" ]; then echo -e "${RED}❌ 获取 IP 列表失败，请检查网络。${NC}"; pause_prompt; continue; fi
+
+                echo -e "${YELLOW}>>> 正在配置防火墙规则 (可能需要几十秒)...${NC}"
+
+                if [ "$FW_TYPE" == "UFW" ]; then
+                    # === UFW 逻辑 ===
+                    # 1. 保命：先允许 SSH
+                    ufw allow 22/tcp >/dev/null
+                    
+                    # 2. 清理旧规则 (删除通用的 80/443 允许)
+                    # 注意：UFW 删除规则如果不匹配会报错，所以重定向错误输出
+                    ufw delete allow 80/tcp >/dev/null 2>&1
+                    ufw delete allow 443/tcp >/dev/null 2>&1
+                    ufw delete allow 80 >/dev/null 2>&1
+                    ufw delete allow 443 >/dev/null 2>&1
+
+                    # 3. 循环添加白名单
+                    for ip in $cf_ipv4; do 
+                        ufw allow from $ip to any port 80 proto tcp >/dev/null
+                        ufw allow from $ip to any port 443 proto tcp >/dev/null
+                    done
+                    for ip in $cf_ipv6; do 
+                        ufw allow from $ip to any port 80 proto tcp >/dev/null
+                        ufw allow from $ip to any port 443 proto tcp >/dev/null
+                    done
+                    
+                    ufw reload
+                else
+                    # === Firewalld 逻辑 ===
+                    # 1. 保命
+                    firewall-cmd --permanent --add-service=ssh >/dev/null
+                    
+                    # 2. 移除通用服务
+                    firewall-cmd --permanent --remove-service=http >/dev/null 2>&1
+                    firewall-cmd --permanent --remove-service=https >/dev/null 2>&1
+                    
+                    # 3. 添加 Rich Rules
+                    echo -e "正在写入规则..."
+                    for ip in $cf_ipv4; do 
+                        firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='$ip' port protocol='tcp' port='80' accept" >/dev/null
+                        firewall-cmd --permanent --add-rich-rule="rule family='ipv4' source address='$ip' port protocol='tcp' port='443' accept" >/dev/null
+                    done
+                    for ip in $cf_ipv6; do
+                        firewall-cmd --permanent --add-rich-rule="rule family='ipv6' source address='$ip' port protocol='tcp' port='80' accept" >/dev/null
+                        firewall-cmd --permanent --add-rich-rule="rule family='ipv6' source address='$ip' port protocol='tcp' port='443' accept" >/dev/null
+                    done
+                    
+                    firewall-cmd --reload
+                fi
+                echo -e "${GREEN}✔ 已开启白名单限制！现在只有 Cloudflare 能连接你的 80/443 端口。${NC}"
+                pause_prompt
+                ;;
+                
+            2)
+                echo -e "${YELLOW}>>> 正在恢复全网访问...${NC}"
+                if [ "$FW_TYPE" == "UFW" ]; then
+                    ufw allow 80/tcp
+                    ufw allow 443/tcp
+                    # 注意：我们不自动删除刚才加的几百条 CF 规则，因为加上通用规则后，白名单就自动失效了（变得不重要了）
+                    # 这样处理速度最快，而且不影响使用
+                else
+                    firewall-cmd --permanent --add-service=http
+                    firewall-cmd --permanent --add-service=https
+                    firewall-cmd --reload
+                fi
+                echo -e "${GREEN}✔ 已恢复全网访问。${NC}"
+                pause_prompt
+                ;;
         esac
     done
 }
 
 function security_center() {
     while true; do
-        clear; echo -e "${YELLOW}=== 🛡️ 安全防御中心 (V10.1) ===${NC}"
+        clear; echo -e "${YELLOW}=== 🛡️ 安全防御中心 (Iron Wall V11.1) ===${NC}"
         
         # 1. 防火墙状态
-        if command -v ufw >/dev/null; then
-            if ufw status | grep -q "active"; then FW_ST="${GREEN}● 运行中 (UFW)${NC}"; else FW_ST="${RED}● 未启动${NC}"; fi
-        elif command -v firewall-cmd >/dev/null; then
-            if firewall-cmd --state 2>&1 | grep -q "running"; then FW_ST="${GREEN}● 运行中 (Firewalld)${NC}"; else FW_ST="${RED}● 未启动${NC}"; fi
-        else
-            FW_ST="${YELLOW}● 未安装${NC}"
-        fi
-
+        if command -v ufw >/dev/null; then FW_ST="${GREEN}● UFW${NC}"; else FW_ST="${RED}● Off${NC}"; fi
+        
         # 2. Fail2Ban状态
-        if command -v fail2ban-client >/dev/null; then
-            if systemctl is-active fail2ban >/dev/null 2>&1; then F2B_ST="${GREEN}● 运行中${NC}"; else F2B_ST="${RED}● 已停止${NC}"; fi
-        else
-            F2B_ST="${YELLOW}● 未安装${NC}"
-        fi
+        if systemctl is-active fail2ban >/dev/null 2>&1; then F2B_ST="${GREEN}● On${NC}"; else F2B_ST="${RED}● Off${NC}"; fi
 
-        # 3. WAF状态 
+        # 3. WAF状态
         if [ -z "$(ls -A $SITES_DIR)" ]; then
             WAF_ST="${YELLOW}● 无站点${NC}"
         else
-            # 关键点：这里必须匹配 V10.1
-            if grep -r "V10.1" "$SITES_DIR" >/dev/null 2>&1; then 
-                WAF_ST="${GREEN}● 已部署 (增强版 V10.1)${NC}"
+            if grep -r "V10.3" "$SITES_DIR" >/dev/null 2>&1; then 
+                WAF_ST="${GREEN}● 增强版 (V10.3)${NC}"
             elif grep -r "waf.conf" "$SITES_DIR" >/dev/null 2>&1; then 
                 WAF_ST="${YELLOW}● 已部署 (基础版)${NC}"
             else 
@@ -551,13 +871,19 @@ function security_center() {
         echo -e " 1. 端口防火墙   [$FW_ST]"
         echo -e " 2. 流量访问控制 (Nginx Layer7)"
         echo -e " 3. SSH防暴力破解 [$F2B_ST]"
-        echo -e " 4. 网站防火墙    [$WAF_ST]"
+        echo -e " 4. 网站防火墙    [$WAF_ST]" 
         echo -e " 5. HTTPS证书管理"
         echo -e " 6. 防盗链设置"
-        echo -e " 7. ${CYAN}主机安全审计 (扫描/挖矿检测)${NC}"
+        echo -e " 7. 主机安全审计 (进程扫描)"
+        echo "--------------------------"
+        echo -e " 8. ${CYAN}Cloudflare 真实 IP 修复${NC} (日志显示真IP)"
+        echo -e " 9. ${RED}Webshell 查杀与加固${NC} (防木马)"
+        echo -e " 10. ${GREEN}宿主机自动安全更新${NC} (防漏洞)"
+        echo -e " 11. ${RED}Cloudflare 防火墙白名单${NC} (防源站泄露)"
+        echo "--------------------------"
         echo " 0. 返回主菜单"
         echo "--------------------------"
-        read -p "请输入选项 [0-7]: " s
+        read -p "请输入选项 [0-11]: " s
         case $s in 
             0) return;; 
             1) port_manager;; 
@@ -567,8 +893,118 @@ function security_center() {
             5) cert_management;; 
             6) manage_hotlink;; 
             7) server_audit;; 
+            8) fix_cloudflare_ip;;
+            9) malware_scan;;
+            10) enable_auto_updates;;
+            11) whitelist_cloudflare_firewall;;
         esac
     done 
+}
+
+function socat_manager() {
+    # 依赖检查
+    if ! command -v socat >/dev/null 2>&1; then
+        echo -e "${YELLOW}>>> 正在安装 Socat (用于端口转发)...${NC}"
+        if [ -f /etc/debian_version ]; then 
+            apt-get update && apt-get install -y socat
+        else 
+            yum install -y socat
+        fi
+    fi
+
+    # 智能获取 Docker 网桥 IP (容器看到的宿主机IP)
+    # 尝试获取 docker0 的 IP，如果获取不到则默认 172.17.0.1
+    local bridge_ip=$(ip -4 addr show docker0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -1)
+    [ -z "$bridge_ip" ] && bridge_ip="172.17.0.1"
+
+    while true; do
+        clear
+        echo -e "${YELLOW}=== 🌉 宿主机应用穿透 (Localhost Proxy) ===${NC}"
+        echo -e "功能: 让容器能访问宿主机的 127.0.0.1 应用"
+        echo -e "原理: Docker网桥($bridge_ip:Port) -> 转发 -> 宿主机(127.0.0.1:Port)"
+        echo "------------------------------------------------"
+        
+        # 列出当前已存在的转发服务
+        echo -e "${CYAN}当前转发列表:${NC}"
+        local count=0
+        for s in /etc/systemd/system/mmp-socat-*.service; do
+            if [ -f "$s" ]; then
+                # 从文件名提取端口 mmp-socat-8080.service -> 8080
+                local p=$(basename "$s" | sed 's/mmp-socat-//;s/.service//')
+                # 检查运行状态
+                if systemctl is-active --quiet "mmp-socat-$p"; then st="${GREEN}● 运行中${NC}"; else st="${RED}● 已停止${NC}"; fi
+                echo -e " - 转发端口: ${GREEN}$p${NC} \t状态: $st"
+                ((count++))
+            fi
+        done
+        [ "$count" -eq 0 ] && echo " (暂无转发配置)"
+        
+        echo "------------------------------------------------"
+        echo " 1. 添加新的转发规则"
+        echo " 2. 删除/停止 转发规则"
+        echo " 0. 返回"
+        echo "------------------------------------------------"
+        read -p "请选择: " o
+
+        case $o in
+            0) return;;
+            
+            1)
+                echo -e "${YELLOW}>>> 新增转发规则${NC}"
+                read -p "1. 请输入宿主机应用端口 (例如 3000): " host_port
+                read -p "2. 请输入容器访问端口 (留空同上): " docker_port
+                [ -z "$docker_port" ] && docker_port="$host_port"
+
+                service_name="mmp-socat-${docker_port}"
+                service_file="/etc/systemd/system/${service_name}.service"
+
+                # 写入 Systemd 服务文件
+                cat > "$service_file" <<EOF
+[Unit]
+Description=MMP Socat Forwarder ($docker_port -> 127.0.0.1:$host_port)
+After=network.target docker.service
+
+[Service]
+Type=simple
+User=root
+# 核心命令：监听 Docker 网桥 IP，转发到 本地回环 IP
+ExecStart=/usr/bin/socat TCP-LISTEN:${docker_port},bind=${bridge_ip},fork TCP:127.0.0.1:${host_port}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+                # 启动服务
+                systemctl daemon-reload
+                systemctl enable "$service_name" >/dev/null 2>&1
+                systemctl start "$service_name"
+                
+                echo -e "${GREEN}✔ 穿透服务已启动！${NC}"
+                echo "------------------------------------------------"
+                echo -e "🚀 你的容器现在可以通过以下地址访问宿主机应用："
+                echo -e "   ${CYAN}http://${bridge_ip}:${docker_port}${NC}"
+                echo "------------------------------------------------"
+                pause_prompt
+                ;;
+
+            2)
+                read -p "请输入要删除的【容器访问端口】: " d_port
+                service_name="mmp-socat-${d_port}"
+                
+                if [ -f "/etc/systemd/system/${service_name}.service" ]; then
+                    systemctl stop "$service_name"
+                    systemctl disable "$service_name" >/dev/null 2>&1
+                    rm -f "/etc/systemd/system/${service_name}.service"
+                    systemctl daemon-reload
+                    echo -e "${GREEN}✔ 已删除规则: $d_port${NC}"
+                else
+                    echo -e "${RED}❌ 规则不存在${NC}"
+                fi
+                pause_prompt
+                ;;
+        esac
+    done
 }
 
 function ssh_key_manager() {
@@ -1171,6 +1607,141 @@ function component_manager() {
     done 
 }
 
+function add_basic_auth() {
+    # 依赖检查
+    if ! command -v htpasswd >/dev/null 2>&1; then
+        echo -e "${YELLOW}>>> 正在安装 apache2-utils...${NC}"
+        if [ -f /etc/debian_version ]; then apt-get update && apt-get install -y apache2-utils
+        else yum install -y httpd-tools; fi
+    fi
+
+    while true; do
+        clear
+        echo -e "${YELLOW}=== 🔐 通用型二级密码锁 (Universal Auth) ===${NC}"
+        echo -e "功能：为任何站点/应用添加 HTTP Basic Auth 认证。"
+        echo "--------------------------"
+        
+        ls -1 "$SITES_DIR"
+        echo "--------------------------"
+        read -p "请输入要加锁的域名 (0返回): " d
+        [ "$d" == "0" ] && return
+        
+        sdir="$SITES_DIR/$d"
+        if [ ! -d "$sdir" ]; then echo -e "${RED}目录不存在${NC}"; sleep 1; continue; fi
+        
+        # 1. 智能探测配置文件
+        nginx_conf=""
+        docker_yml="$sdir/docker-compose.yml"
+        
+        if [ -f "$sdir/nginx.conf" ]; then
+            nginx_conf="$sdir/nginx.conf"      # WordPress 或 标准站点
+            conf_type="std"
+        elif [ -f "$sdir/nginx-proxy.conf" ]; then
+            nginx_conf="$sdir/nginx-proxy.conf" # 反向代理站点
+            conf_type="proxy"
+        else
+            echo -e "${RED}未找到支持的 Nginx 配置文件，无法加锁。${NC}"
+            echo "目前仅支持通过本脚本部署的 WP 或 Proxy 站点。"
+            pause_prompt; continue
+        fi
+
+        echo -e "当前选中: ${CYAN}$d${NC} (类型: $conf_type)"
+        echo "--------------------------"
+        echo " 1. 开启/重置 密码锁"
+        echo " 2. 关闭 密码锁"
+        echo " 0. 返回"
+        read -p "选择: " op
+        
+        if [ "$op" == "1" ]; then
+            echo -e "\n${YELLOW}--- 模式选择 ---${NC}"
+            echo " A. 全站加锁 (访问域名就需要密码，适合私有应用)"
+            echo " B. 仅登录页加锁 (适合 WordPress，仅保护 wp-login.php)"
+            read -p "请选择模式 [A/B]: " mode
+            
+            # 输入用户名密码
+            read -p "设置用户名 (默认admin): " u; [ -z "$u" ] && u="admin"
+            read -p "设置密码: " p
+            if [ -z "$p" ]; then echo "密码不能为空"; sleep 1; continue; fi
+
+            # 生成密码文件
+            echo -e "${YELLOW}>>> 生成密码文件...${NC}"
+            htpasswd -bc "$sdir/.htpasswd" "$u" "$p"
+            
+            # --- 核心逻辑：挂载 .htpasswd 到容器 ---
+            # 检查 docker-compose.yml 是否已经挂载了 .htpasswd
+            # 我们利用 grep 检查，如果没有，就用 sed 插入
+            if ! grep -q "\.htpasswd" "$docker_yml"; then
+                echo -e "${YELLOW}>>> 正在注入挂载配置...${NC}"
+                # 寻找挂载 Nginx 配置的那一行，在它下面追加一行
+                # 兼容 nginx.conf 和 nginx-proxy.conf 的挂载写法
+                if grep -q "nginx.conf:/etc/nginx/conf.d/default.conf" "$docker_yml"; then
+                     sed -i '/nginx.conf:\/etc\/nginx\/conf.d\/default.conf/a \      - ./.htpasswd:/etc/nginx/conf.d/.htpasswd' "$docker_yml"
+                elif grep -q "nginx-proxy.conf:/etc/nginx/conf.d/default.conf" "$docker_yml"; then
+                     sed -i '/nginx-proxy.conf:\/etc\/nginx\/conf.d\/default.conf/a \      - ./.htpasswd:/etc/nginx/conf.d/.htpasswd' "$docker_yml"
+                else
+                     echo -e "${RED}⚠️  自动挂载失败，请手动修改 docker-compose.yml 挂载 .htpasswd${NC}"
+                fi
+                need_restart=1
+            else
+                need_restart=0
+            fi
+
+            # --- 核心逻辑：修改 Nginx 配置 ---
+            # 先清理旧的 auth 配置，防止重复
+            sed -i '/auth_basic/d' "$nginx_conf"
+            
+            if [ "$mode" == "A" ] || [ "$mode" == "a" ]; then
+                # === 模式 A: 全站加锁 ===
+                # 在 "location / {" 后面插入认证指令
+                sed -i '/location \/ {/a \        auth_basic "Private Site";\n        auth_basic_user_file /etc/nginx/conf.d/.htpasswd;' "$nginx_conf"
+                echo -e "${GREEN}✔ 已配置全站锁定${NC}"
+                
+            else
+                # === 模式 B: 特定路径 (WP专用) ===
+                if [ "$conf_type" != "std" ]; then
+                    echo -e "${RED}❌ 代理模式暂不支持路径锁，已自动切换为全站锁。${NC}"
+                    sed -i '/location \/ {/a \        auth_basic "Private Site";\n        auth_basic_user_file /etc/nginx/conf.d/.htpasswd;' "$nginx_conf"
+                else
+                    # 针对 WordPress 结构，寻找 wp-login.php 的 location
+                    if grep -q "location = /wp-login.php" "$nginx_conf"; then
+                        sed -i '/location = \/wp-login.php {/a \        auth_basic "Admin Only";\n        auth_basic_user_file /etc/nginx/conf.d/.htpasswd;' "$nginx_conf"
+                    else
+                        # 如果没找到 location (旧版配置)，提示用户重建
+                        echo -e "${RED}⚠️  未找到 wp-login.php 配置段，请先升级站点配置(重建站点)。${NC}"
+                        pause_prompt; continue
+                    fi
+                fi
+                echo -e "${GREEN}✔ 已配置登录页锁定${NC}"
+            fi
+
+            # 应用更改
+            echo -e "${YELLOW}>>> 正在应用更改...${NC}"
+            if [ "$need_restart" -eq 1 ]; then
+                # 如果修改了挂载，必须 recreate
+                cd "$sdir" && docker compose up -d --force-recreate
+            else
+                # 如果只是改了 Nginx 配置，reload 即可 (极速)
+                # 获取容器名进行 reload
+                container_name=$(docker compose -f "$docker_yml" ps -q | head -n 1) # 简单粗暴获取第一个容器ID作为上下文
+                # 更精准的方法：
+                if [ "$conf_type" == "std" ]; then svc="nginx"; else svc="proxy"; fi
+                cd "$sdir" && docker compose exec "$svc" nginx -s reload
+            fi
+            
+            echo -e "${GREEN}✔ 部署完成！${NC}"
+            
+        elif [ "$op" == "2" ]; then
+            echo -e "${YELLOW}>>> 正在移除密码锁...${NC}"
+            sed -i '/auth_basic/d' "$nginx_conf"
+            if [ "$conf_type" == "std" ]; then svc="nginx"; else svc="proxy"; fi
+            cd "$sdir" && docker compose exec "$svc" nginx -s reload
+            echo -e "${GREEN}✔ 密码锁已关闭${NC}"
+        fi
+        
+        pause_prompt
+    done
+}
+
 function fail2ban_manager() {
     # 定义日志路径
     local nginx_log="$LOG_DIR/access.log"
@@ -1213,7 +1784,9 @@ function fail2ban_manager() {
                 # 3. 写入过滤规则
                 cat > /etc/fail2ban/filter.d/nginx-scan.conf <<EOF
 [Definition]
-failregex = ^<HOST> -.*"(GET|POST|HEAD).*" (404|444|403) .*$
+failregex = ^<HOST> -.*"(GET|POST|HEAD).*" (404|444|403|401|429) .*$
+            ^<HOST> -.*"POST .*wp-login.php.*" 200 .*$ 
+            # 上面这行可选：如果你觉得有人不停POST登录页(即使返回200也是在试密码)也该封，就加上
 ignoreregex =
 EOF
 
@@ -1221,23 +1794,23 @@ EOF
                 cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
 ignoreip = 127.0.0.1/8 ::1
-bantime  = 86400    ; 封禁 24小时
-findtime = 300      ; 5分钟内
-maxretry = 3        ; <--- 只需要3次错误就封禁！
+bantime  = 86400    ; 封禁 1 天
+findtime = 3000      ; 50分钟内
+maxretry = 3        ; 只有3次机会
 
 [sshd]
 enabled = true
 port    = ssh
 logpath = $ssh_log
 backend = systemd
-maxretry = 3        ; SSH 输错3次密码也封
+maxretry = 3
 
 [nginx-scan]
 enabled = true
 filter  = nginx-scan
 logpath = $nginx_log
 port    = http,https
-maxretry = 3        ; 扫描/WAF 触发3次即封
+maxretry = 5        ; 触发5次 Nginx 错误(含限速/404)即封禁
 action  = iptables-allports[name=nginx-scan]
 EOF
 
@@ -1274,9 +1847,10 @@ EOF
     done
 }
 
+# === [修复版] WAF 管理器 (移除网关专用变量) ===
 function waf_manager() { 
     while true; do 
-        clear; echo -e "${YELLOW}=== 🛡️ WAF 网站防火墙 (V10.1 Pro) ===${NC}"
+        clear; echo -e "${YELLOW}=== 🛡️ WAF 网站防火墙 (V10.3 Stable) ===${NC}"
         echo " 1. 部署/更新 究极防御规则"
         echo " 2. 查看当前规则内容"
         echo " 0. 返回上一级"
@@ -1285,11 +1859,13 @@ function waf_manager() {
         case $o in 
             0) return;; 
             1) 
-                echo -e "${BLUE}>>> 正在生成 V10.1 修正版规则...${NC}"
+                echo -e "${BLUE}>>> 正在生成 V10.3 稳定版规则...${NC}"
                 
+                # 修复核心：移除了 $block_bot 检查
+                # 爬虫拦截由网关负责，站点容器只负责防注入
                 cat >/tmp/w <<EOF
 # ==================================================
-#   V10.1 Ultimate WAF Rules (Fixed)
+#   V10.3 Ultimate WAF Rules (Site Level)
 # ==================================================
 
 # --- [1] 系统与敏感文件保护 ---
@@ -1297,12 +1873,10 @@ location ~* \.(engine|inc|info|install|make|module|profile|test|po|sh|.*sql|them
 location ~* \.(bak|config|sql|fla|psd|ini|log|sh|inc|swp|dist|exe|bat|dll)$ { return 403; }
 location ~* /\.(git|svn|hg|env|ssh|vscode|idea) { return 403; }
 location ~* (wp-config\.php|readme\.html|license\.txt|debug\.log)$ { return 403; }
-# 屏蔽 XML-RPC (如需 Jetpack 请注释此行)
 location = /xmlrpc.php { deny all; return 403; }
 
-# --- [2] SQL 注入防御 (增强版) ---
+# --- [2] SQL 注入防御 ---
 set \$block_sql_injections 0;
-# [修复点] 去掉了后面的括号限制，只要出现 union select 就拦截
 if (\$query_string ~* "union.*select") { set \$block_sql_injections 1; } 
 if (\$query_string ~* "union.*all.*select") { set \$block_sql_injections 1; }
 if (\$query_string ~* "concat.*\(") { set \$block_sql_injections 1; }
@@ -1323,22 +1897,21 @@ if (\$query_string ~* "javascript:") { set \$block_xss 1; }
 if (\$query_string ~* "(onload|onerror|onmouseover)=") { set \$block_xss 1; }
 if (\$block_xss = 1) { return 403; }
 
-# --- [5] 恶意爬虫 ---
-if (\$http_user_agent ~* (Acunetix|AppScan|ApacheBench|Burp|Dirbuster|Go-http-client|Harvest|Havij|Hydra|Java|Jorgee|libwww-perl|masscan|Nessus|Netsparker|Nikto|Nmap|OpenVAS|Pangolin|Python-urllib|SF|sqlmap|Swift|Wget|WinHttp|Xenu|ZmEu)) { return 403; }
+# --- [5] 备用爬虫拦截 (站内硬编码) ---
+if (\$http_user_agent ~* (Acunetix|AppScan|ApacheBench|Burp|Dirbuster|Havij|Hydra|Jorgee|masscan|Nessus|Netsparker|Nikto|OpenVAS|Pangolin|SF|ZmEu)) { return 403; }
 EOF
                 count=0
                 for d in "$SITES_DIR"/*; do 
                     if [ -d "$d" ]; then 
-                        # 强力修复 nginx.conf 引用
+                        # 确保引用
                         if [ -f "$d/nginx.conf" ] && ! grep -q "waf.conf" "$d/nginx.conf"; then
-                             # 在 server { 下面的一行插入 include (更稳健的位置)
                              sed -i '/server_name localhost;/a \    include /etc/nginx/waf.conf;' "$d/nginx.conf"
-                             echo -e " - $(basename "$d"): ${YELLOW}修复配置引用${NC}"
                         fi
 
                         cp /tmp/w "$d/waf.conf" 
+                        # 重启站点容器
                         cd "$d" && docker compose exec -T nginx nginx -s reload >/dev/null 2>&1
-                        echo -e " - $(basename "$d"): ${GREEN}V10.1 规则已生效${NC}"
+                        echo -e " - $(basename "$d"): ${GREEN}V10.3 规则已生效${NC}"
                         ((count++))
                     fi 
                 done
@@ -1381,29 +1954,32 @@ function traffic_manager() {
     # 内部函数：安全重载 Nginx
     function safe_reload() {
         echo -e "${YELLOW}>>> 正在测试 Nginx 配置...${NC}"
-        # 预检配置，防止写错导致网关挂掉
+        # 预检配置
         if docker exec gateway_proxy nginx -t >/dev/null 2>&1; then
-            docker exec gateway_proxy nginx -s reload
+            reload_gateway_config # 调用之前修复过的带等待的重启函数
             echo -e "${GREEN}✔ 配置生效${NC}"
         else
             echo -e "${RED}❌ 配置有误，Nginx 拒绝加载！${NC}"
-            echo -e "请检查刚才输入的规则是否正确，或尝试清空规则。"
+            echo -e "请尝试清空规则。"
         fi
     }
 
     # 内部函数：校验 IP 格式
     function validate_ip() {
         local ip=$1
-        if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
-            return 0
-        else
-            return 1
-        fi
+        if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then return 0; else return 1; fi
     }
 
     while true; do 
         clear; echo -e "${YELLOW}=== 🌐 流量控制加强版 (Traffic ACL) ===${NC}"
         echo -e "当前规则数: IP[$(wc -l < "$FW_DIR/access.conf")] | 国家[$(wc -l < "$FW_DIR/geo.conf")]"
+        # 检查爬虫规则是否开启 (检查文件内容是否包含 map)
+        if grep -q "map \$http_user_agent" "$FW_DIR/bots.conf"; then
+            BOT_ST="${GREEN}已开启${NC}"
+        else
+            BOT_ST="${YELLOW}未开启${NC}"
+        fi
+        echo -e "爬虫拦截状态: $BOT_ST"
         echo "--------------------------"
         echo " 1. 添加 黑/白 名单 IP"
         echo " 2. 查看 已封禁/放行 列表"
@@ -1425,39 +2001,31 @@ function traffic_manager() {
                 echo -e "2. 白名单 (Allow) - 允许访问 (需配合 deny all 使用)"
                 read -p "请选择类型 [1/2]: " type
                 if [ "$type" == "1" ]; then rule="deny"; else rule="allow"; fi
-                
-                read -p "请输入 IP 或网段 (如 1.2.3.4 或 1.2.3.0/24): " ip
+                read -p "请输入 IP 或网段: " ip
                 if validate_ip "$ip"; then
                     if grep -q "$ip;" "$FW_DIR/access.conf"; then
-                        echo -e "${YELLOW}该 IP 已存在于列表中${NC}"
+                        echo -e "${YELLOW}该 IP 已存在${NC}"
                     else
                         echo "$rule $ip;" >> "$FW_DIR/access.conf"
                         safe_reload
                     fi
                 else
-                    echo -e "${RED}❌ IP 格式错误！${NC}"
+                    echo -e "${RED}❌ IP 格式错误${NC}"
                 fi
                 pause_prompt;; 
             
             2) 
-                echo -e "${CYAN}=== 当前 IP 规则列表 ===${NC}"
-                if [ -s "$FW_DIR/access.conf" ]; then
-                    cat -n "$FW_DIR/access.conf"
-                else
-                    echo "列表为空"
-                fi
-                echo "--------------------------"
+                echo -e "${CYAN}=== IP 规则列表 ===${NC}"
+                [ -s "$FW_DIR/access.conf" ] && cat -n "$FW_DIR/access.conf" || echo "列表为空"
                 pause_prompt;;
 
             3) 
-                echo -e "${CYAN}=== 删除规则 ===${NC}"
-                if [ ! -s "$FW_DIR/access.conf" ]; then echo "列表为空"; pause_prompt; continue; fi
+                [ ! -s "$FW_DIR/access.conf" ] && echo "列表为空" && pause_prompt && continue
                 cat -n "$FW_DIR/access.conf"
-                echo "--------------------------"
-                read -p "请输入要删除的 IP (输入内容): " del_ip
+                read -p "请输入要删除的 IP: " del_ip
                 if [ ! -z "$del_ip" ]; then
                     sed -i "/$del_ip;/d" "$FW_DIR/access.conf"
-                    echo -e "${GREEN}已删除包含 $del_ip 的规则${NC}"
+                    echo -e "${GREEN}已删除${NC}"
                     safe_reload
                 fi
                 pause_prompt;;
@@ -1465,34 +2033,36 @@ function traffic_manager() {
             4) 
                 read -p "请输入国家代码 (如 cn, ru, us): " c
                 c=$(echo "$c" | tr '[:upper:]' '[:lower:]')
-                echo -e "${YELLOW}>>> 正在下载 $c IP 段数据...${NC}"
-                
+                echo -e "${YELLOW}>>> 正在下载 $c IP 段...${NC}"
                 if curl -sL "http://www.ipdeny.com/ipblocks/data/countries/$c.zone" -o /tmp/ip_list.txt; then
                     if [ -s /tmp/ip_list.txt ] && ! grep -q "DOCTYPE" /tmp/ip_list.txt; then
                         while read line; do echo "deny $line;" >> "$FW_DIR/geo.conf"; done < /tmp/ip_list.txt
                         rm /tmp/ip_list.txt
                         safe_reload
                     else
-                        echo -e "${RED}❌ 下载失败或国家代码无效${NC}"
+                        echo -e "${RED}❌ 国家代码无效${NC}"
                     fi
                 else
-                    echo -e "${RED}❌ 网络连接失败${NC}"
+                    echo -e "${RED}❌ 下载失败${NC}"
                 fi
                 pause_prompt;; 
             
             5)
-                # [修复] 补全了这里的逻辑
-                echo -e "这将屏蔽常见扫描器: curl, wget, python, go-http, sqlmap 等。"
+                echo -e "屏蔽常见扫描器: curl, wget, python, go-http, sqlmap, nmap 等。"
                 read -p "是否开启? (y=开启, n=关闭): " bot_confirm
                 if [ "$bot_confirm" == "y" ]; then
-                    # 1. 写入配置
+                    # 【核心修复】使用 map 代替 if
+                    # 如果匹配到爬虫，将变量 $block_bot 置为 1，否则为 0
                     cat > "$FW_DIR/bots.conf" <<EOF
-if (\$http_user_agent ~* (Scrapy|Curl|HttpClient|Java|Wget|Python|Go-http-client|SQLMap|Nmap|Nikto|Havij)) { return 403; }
+map \$http_user_agent \$block_bot {
+    default 0;
+    "~*(Scrapy|Curl|HttpClient|Java|Wget|Python|Go-http-client|SQLMap|Nmap|Nikto|Havij|Indy Library)" 1;
+}
 EOF
-                    echo -e "${GREEN}>>> 已写入爬虫拦截规则${NC}"
+                    echo -e "${GREEN}>>> 已写入爬虫拦截规则 (Map模式)${NC}"
+                    echo -e "${YELLOW}注意: 需要更新 WAF 规则 (菜单 30-1) 才能在站点生效。${NC}"
                     safe_reload
                 else
-                    # 2. 清空配置 (相当于关闭)
                     echo "" > "$FW_DIR/bots.conf"
                     echo -e "${YELLOW}>>> 已关闭爬虫拦截${NC}"
                     safe_reload
@@ -1500,7 +2070,7 @@ EOF
                 pause_prompt;; 
 
             6) 
-                read -p "确定清空所有 IP、国家和爬虫规则吗? (y/n): " confirm
+                read -p "确定清空所有规则吗? (y/n): " confirm
                 if [ "$confirm" == "y" ]; then
                     echo "" > "$FW_DIR/access.conf"
                     echo "" > "$FW_DIR/geo.conf"
@@ -2029,6 +2599,9 @@ EOF
 
     # 2. 生成 Nginx 配置
     cat > "$sdir/nginx.conf" <<EOF
+# 定义限速区：以IP为key，内存10M，速率限制为每秒1次请求
+limit_req_zone \$binary_remote_addr zone=wp_login_limit:10m rate=1r/s;
+
 server { 
     listen 80; 
     server_name localhost;
@@ -2042,6 +2615,19 @@ server {
         try_files \$uri \$uri/ /index.php?\$args; 
     } 
     
+    # [新增] 专门保护登录页
+    location = /wp-login.php {
+        # 应用限速：允许瞬间突发3个请求，超过则返回 429 错误
+        limit_req zone=wp_login_limit burst=3 nodelay;
+        # 返回 429 状态码 (Too Many Requests)，方便 Fail2Ban 抓取
+        limit_req_status 429; 
+        
+        include fastcgi_params;
+        fastcgi_pass wordpress:9000;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        fastcgi_param PATH_INFO \$fastcgi_path_info;
+    }
+
     location ~ \.php$ { 
         try_files \$uri =404; 
         fastcgi_split_path_info ^(.+\.php)(/.+)$; 
@@ -2355,6 +2941,7 @@ function manage_remarks() {
     done
 }
 
+# === [V3.1 完善版] HTTPS 证书高级管理中心 ===
 function cert_management() {
     # 依赖工具函数：计算剩余天数
     function get_cert_days() {
@@ -2367,16 +2954,16 @@ function cert_management() {
 
     while true; do
         clear
-        echo -e "${YELLOW}=== 🔐 HTTPS 证书高级管理中心 ===${NC}"
+        echo -e "${YELLOW}=== 🔐 HTTPS 证书高级管理中心 (Final) ===${NC}"
         echo -e "核心网关: gateway_proxy | 签发容器: gateway_acme"
         echo "---------------------------------------------------------"
         echo -e " 1. ${GREEN}证书状态看板${NC} (显示过期时间/剩余天数)"
         echo " 2. 查看申请日志 (排查申请卡住/失败原因)"
-        echo " 3. 强制重签所有证书 (Force Renew All)"
+        echo " 3. ${GREEN}强制重签所有证书 (推荐，最稳妥)${NC}"
         echo " 4. 部署自定义证书 (上传 .crt 和 .key)"
-        echo " 5. 删除/重置指定证书 (用于申请失败重试)"
+        echo " 5. 删除/重置指定证书 (慎用)"
         echo " 6. 备份所有证书到本地"
-        echo -e " 7. ${CYAN}重新申请/续签指定域名 (Re-issue Specific)${NC}" 
+        echo -e " 7. ${CYAN}强制重签 [指定] 域名 (单域名 Force Renew)${NC}" 
         echo " 0. 返回上一级"
         echo "---------------------------------------------------------"
         read -p "请输入选项 [0-7]: " c
@@ -2386,7 +2973,7 @@ function cert_management() {
             
             1)
                 clear
-                echo -e "${YELLOW}>>> 正在扫描证书信息，请稍候...${NC}"
+                echo -e "${YELLOW}>>> 正在扫描证书信息...${NC}"
                 printf "${CYAN}%-25s %-30s %-10s${NC}\n" "域名 (Domain)" "过期时间 (Expire)" "剩余天数"
                 echo "----------------------------------------------------------------------"
                 certs=$(docker exec gateway_acme find /etc/nginx/certs -name "*.crt" 2>/dev/null)
@@ -2420,12 +3007,11 @@ function cert_management() {
                 ;;
                 
             3)
-                echo -e "${RED}⚠️  警告: 强制重签所有证书可能触发 Rate Limit。${NC}"
-                read -p "确认执行? (输入 renew 确认): " confirm
-                if [ "$confirm" == "renew" ]; then
-                    docker exec gateway_acme /app/force_renew
-                    echo -e "${GREEN}✔ 命令已发送。${NC}"
-                fi
+                echo -e "${YELLOW}>>> 正在执行全量强制续签 (Force Renew All)...${NC}"
+                # 使用官方内置脚本
+                docker exec gateway_acme /app/force_renew
+                echo -e "${GREEN}✔ 命令已发送。${NC}"
+                echo -e "ACME 容器正在后台逐个处理，请稍后通过 [1] 检查状态。"
                 pause_prompt
                 ;;
                 
@@ -2449,14 +3035,12 @@ function cert_management() {
                 ;;
                 
             5)
-                echo -e "${RED}>>> 删除证书 (彻底重置)${NC}"
-                echo "此操作会删除证书文件，如果不存了，ACME 容器会自动检测并尝试重新申请。"
                 read -p "请输入要删除的域名: " d
                 read -p "确认删除? (y/n): " confirm
                 if [ "$confirm" == "y" ]; then
-                    docker exec gateway_acme rm -f "/etc/nginx/certs/$d.crt" "/etc/nginx/certs/$d.key" "/etc/nginx/certs/$d.chain.pem"
+                    docker exec gateway_acme rm -f "/etc/nginx/certs/$d.crt" "/etc/nginx/certs/$d.key"
                     docker restart gateway_acme
-                    echo -e "${GREEN}✔ 已删除并重启 ACME 容器，请等待重新申请。${NC}"
+                    echo -e "${GREEN}✔ 已删除。${NC}"
                 fi
                 pause_prompt
                 ;;
@@ -2470,20 +3054,21 @@ function cert_management() {
                 ;;
 
             7)
-                echo -e "${YELLOW}>>> 强制重签指定域名 (Re-issue Specific)${NC}"
-                echo -e "此操作会调用 acme.sh 对指定域名进行强制续签 (--force)。"
+                echo -e "${YELLOW}>>> 强制重签 [指定] 域名 (Single Domain Force)${NC}"
+                echo -e "原理: 直接调用 ACME 协议进行强制更新，不依赖文件删除。"
                 read -p "请输入域名: " d
                 if [ -z "$d" ]; then continue; fi
                 
-                echo -e "${CYAN}正在请求续签 $d ...${NC}"
-                # 尝试调用容器内的 acme.sh
-                if docker exec gateway_acme /etc/acme.sh/acme.sh --renew -d "$d" --force; then
-                    echo -e "${GREEN}✔ 续签命令执行成功！${NC}"
+                echo -e "${CYAN}正在请求 Let's Encrypt 强制续签 $d ...${NC}"
+                
+                # 【核心修复】使用 sh -c 包装命令，让容器自己去找 acme.sh 在哪
+                # 这样就解决了 "/etc/acme.sh/acme.sh no such file" 的问题
+                if docker exec gateway_acme sh -c "acme.sh --renew -d $d --force"; then
+                    echo -e "${GREEN}✔ 续签成功！${NC}"
                     echo "请稍后通过 [1] 查看证书过期时间是否更新。"
                 else
                     echo -e "${RED}❌ 执行失败${NC}"
-                    echo "可能原因：证书尚未生成、域名解析错误或 ACME 服务器繁忙。"
-                    echo "建议尝试 [5] 删除证书后让其重新生成。"
+                    echo -e "可能原因：\n1. 域名解析未生效\n2. Cloudflare 拦截 (请尝试开启 DNS Only)\n3. 1小时内申请次数过多 (Rate Limit)"
                 fi
                 pause_prompt
                 ;;
@@ -2491,7 +3076,7 @@ function cert_management() {
     done
 }
 
-function db_manager() { while true; do clear; echo "1.导出 2.导入 0.返回"; read -p "选: " c; case $c in 0) return;; 1) ls -1 "$SITES_DIR"; read -p "域名: " d; s="$SITES_DIR/$d"; pwd=$(grep MYSQL_ROOT_PASSWORD "$s/docker-compose.yml"|awk -F': ' '{print $2}'); docker compose -f "$s/docker-compose.yml" exec -T db mysqldump -u root -p"$pwd" --all-databases > "$s/${d}.sql"; echo "OK: $s/${d}.sql";; 2) ls -1 "$SITES_DIR"; read -p "域名: " d; read -p "SQL File: " f; s="$SITES_DIR/$d"; pwd=$(grep MYSQL_ROOT_PASSWORD "$s/docker-compose.yml"|awk -F': ' '{print $2}'); cat "$f" | docker compose -f "$s/docker-compose.yml" exec -T db mysql -u root -p"$pwd"; echo "OK";; esac; pause_prompt; done; }
+function db_manager() { while true; do clear; echo "1.导出 2.导入 0.返回"; read -p "选: " c; case $c in 0) return;; 1) ls -1 "$SITES_DIR"; read -p "域名: " d; s="$SITES_DIR/$d"; pwd=$(grep MYSQL_ROOT_PASSWORD "$s/docker-compose.yml"|awk -F': ' '{print $2}'); docker compose -f "$s/docker-compose.yml" exec -T db mysqldump -u root -p"$pwd" --all-databases > "$s/${d}.sql"; echo "OK: $s/${d}.sql";; 2) ls -1 "$SITES_DIR"; read -p "域名: " d; read -p "SQL File: " f; s="$SITES_DIR/$d"; pwd=$(grep MYSQL_ROOT_PASSWORD "$s/docker-compose.yml"|awk -F': ' '{print $2}'); cat "$f" | docker compose -f "$s/docker-compose.yml" exec -T db sh -c 'mysql -u root -p"$MYSQL_ROOT_PASSWORD"'; echo "OK";; esac; pause_prompt; done; }
 
 function change_domain() { 
     while true; do
@@ -2629,7 +3214,7 @@ function perform_backup_logic() {
     rm -rf "$temp_dir"
 }
 
-# === [V3.0 通用版] 核心还原逻辑 ===
+# === [V3.3 终极修复版] 核心还原逻辑 (特殊字符兼容+强制TCP) ===
 function perform_restore_logic() {
     local backup_file=$1
     local target_domain=$2
@@ -2642,66 +3227,84 @@ function perform_restore_logic() {
     read -p "确认执行? (yes/no): " confirm
     if [ "$confirm" != "yes" ]; then return; fi
     
-    # 1. 解压
+    # 1. 解压准备
     local tar_dir=$(tar tf "$backup_file" | head -1 | cut -f1 -d"/")
     tar xzf "$backup_file" -C /tmp
     local restore_path="/tmp/$tar_dir"
 
-    # 2. 清理旧环境 (防止密码/配置冲突)
+    # 2. 彻底清理旧环境
     if [ -d "$target_dir" ]; then
-        echo " - 停止旧服务并清理..."
-        cd "$target_dir" && docker compose down -v >/dev/null 2>&1
-        rm -rf "$target_dir"
+        echo " - 正在清理旧环境..."
+        cd "$target_dir" && docker compose down -v --remove-orphans >/dev/null 2>&1
+        cd "$BASE_DIR" && rm -rf "$target_dir"
     fi
     mkdir -p "$target_dir"
 
     # 3. 恢复配置文件
     echo " - 恢复配置文件..."
-    # 排除 .tar.gz 和 .sql 文件，只复制配置文件
     find "$restore_path" -maxdepth 1 -type f ! -name "*.tar.gz" ! -name "*.sql" -exec cp {} "$target_dir/" \;
 
-    # 4. [通用] 恢复本地 data 目录 (关键修复点)
+    # 4. [通用] 恢复本地 data 目录
+    local raw_db_restored=0
     if [ -f "$restore_path/local_data.tar.gz" ]; then
         echo " - [通用] 恢复本地数据目录 (data)..."
         tar xzf "$restore_path/local_data.tar.gz" -C "$target_dir"
+        
+        # 检查是否还原了原始数据库文件
+        if [ -d "$target_dir/data/mysql" ] || [ -d "$target_dir/mysql" ] || [ -d "$target_dir/db_data" ]; then
+            raw_db_restored=1
+            echo -e "${GREEN}   ✔ 检测到原始数据库文件，将跳过 SQL 导入。${NC}"
+        fi
     fi
 
-    # 5. 启动容器 (初始化环境)
+    # 5. 启动容器
     echo " - 启动容器..."
     cd "$target_dir" && docker compose up -d
 
     # 6. [WP专用] 恢复 Docker 卷
     if [ -f "$restore_path/wp_content.tar.gz" ]; then
         echo " - [WP] 恢复 wp-content 卷..."
-        sleep 3
-        app_c=$(docker compose ps -q wordpress)
+        sleep 2
+        app_c=$(docker compose ps -q wordpress 2>/dev/null)
         if [ ! -z "$app_c" ]; then
             docker run --rm --volumes-from "$app_c" -v "$restore_path":/backup alpine sh -c "tar xzf /backup/wp_content.tar.gz -C /var/www/html"
         fi
     fi
 
-    # 7. [DB] 导入 MySQL (如果存在)
+    # 7. [DB] 导入 MySQL (修复 Access Denied)
     if [ -f "$restore_path/db.sql" ]; then
-        echo " - 检测到 SQL 备份，准备导入..."
-        pwd=$(grep "MYSQL_ROOT_PASSWORD" docker-compose.yml | head -n 1 | awk -F': ' '{print $2}' | tr -d '"' | tr -d "'" | tr -d '\r')
-        
-        if [ ! -z "$pwd" ]; then
-            echo -n "   等待数据库就绪"
+        if [ "$raw_db_restored" -eq 1 ]; then
+            echo -e " - [DB] ${CYAN}跳过 SQL 导入 (原始数据已恢复)。${NC}"
+        else
+            echo " - [DB] 检测到纯 SQL 备份，准备导入..."
+            
+            echo -n "   等待数据库启动"
             db_ready=0
-            for i in {1..30}; do
-                if docker compose exec -T db mysqladmin ping -h localhost -u root -p"$pwd" --silent >/dev/null 2>&1; then
+            # 循环检查数据库状态
+            for i in {1..60}; do
+                # 使用 MYSQL_PWD 避免特殊字符干扰，强制使用 127.0.0.1 走 TCP 协议
+                if docker compose exec -T db sh -c 'export MYSQL_PWD="$MYSQL_ROOT_PASSWORD"; mysqladmin ping -h 127.0.0.1 -u root --silent' >/dev/null 2>&1; then
                     db_ready=1; break
                 fi
-                echo -n "."; sleep 2
+                echo -n "."
+                sleep 2
             done
             echo ""
             
             if [ "$db_ready" -eq 1 ]; then
-                if docker compose exec -T db mysql -u root -p"$pwd" < "$restore_path/db.sql"; then
+                echo "   正在导入数据 (请勿中断)..."
+                # 再次等待 3 秒，防止 MySQL 刚 responding ping 但还没准备好接收 write
+                sleep 3
+                
+                # 【关键修复】使用 MYSQL_PWD 传递密码，使用 -h 127.0.0.1 强制 TCP
+                if docker compose exec -T db sh -c 'export MYSQL_PWD="$MYSQL_ROOT_PASSWORD"; mysql -h 127.0.0.1 -u root < /dev/stdin' < "$restore_path/db.sql"; then
                      echo -e "   ${GREEN}✔ 数据库导入成功${NC}"
                 else
-                     echo -e "   ${RED}❌ SQL 导入失败 (版本不兼容?)${NC}"
+                     echo -e "   ${RED}❌ SQL 导入失败!${NC}"
+                     echo -e "   请尝试手动导入: docker compose exec db mysql -u root -p (回车输密码)"
                 fi
+            else
+                echo -e "${RED}❌ 数据库启动超时。${NC}"
             fi
         fi
     fi
@@ -2710,7 +3313,7 @@ function perform_restore_logic() {
     if type reload_gateway_config >/dev/null 2>&1; then reload_gateway_config; else docker exec gateway_proxy nginx -s reload >/dev/null 2>&1; fi
 
     rm -rf "$restore_path"
-    echo -e "${GREEN}✔ 还原完成${NC}"
+    echo -e "${GREEN}✔ 还原操作结束${NC}"
     write_log "Restored $target_domain"
 }
 
@@ -2718,6 +3321,10 @@ function backup_restore_ops() {
     check_rclone
     local has_remote=0
     if rclone listremotes 2>/dev/null | grep -q "remote:"; then has_remote=1; fi
+    
+    # 确保本地备份目录存在
+    local local_backup_dir="$BASE_DIR/backups"
+    mkdir -p "$local_backup_dir"
 
     while true; do 
         clear; echo -e "${YELLOW}=== 📦 超级备份系统 (本地+云端) ===${NC}"
@@ -2761,6 +3368,8 @@ function backup_restore_ops() {
                 read -p "选择源 [1/2]: " src
                 
                 local backup_file=""
+                
+                # === 分支 2: 云端下载 ===
                 if [ "$src" == "2" ]; then
                     if [ "$has_remote" -eq 0 ]; then echo "未配置云端"; pause_prompt; continue; fi
                     rclone lsl "remote:wp_backups" | tail -n 10
@@ -2768,20 +3377,56 @@ function backup_restore_ops() {
                     echo "下载中..."
                     rclone copy "remote:wp_backups/$fname" "/tmp/"
                     backup_file="/tmp/$fname"
+                
+                # === 分支 1: 本地选择 (核心修复部分) ===
                 else
-                    ls -lh "$BASE_DIR/backups" 2>/dev/null
-                    read -p "输入本地文件全路径: " backup_file
+                    echo -e "${CYAN}=== 本地备份列表 ===${NC}"
+                    # 1. 获取所有 tar.gz 文件到数组
+                    files=("$local_backup_dir"/*.tar.gz)
+                    
+                    # 2. 检查是否有文件
+                    if [ ! -e "${files[0]}" ]; then
+                        echo -e "${RED}❌ 目录 $local_backup_dir 下没有找到备份文件。${NC}"
+                        pause_prompt
+                        continue
+                    fi
+
+                    # 3. 循环显示菜单
+                    local i=1
+                    for f in "${files[@]}"; do
+                        echo -e " $i. $(basename "$f")  \t [$(du -h "$f" | awk '{print $1}')]"
+                        ((i++))
+                    done
+                    echo "--------------------------------"
+                    
+                    # 4. 用户输入编号
+                    read -p "请输入文件编号: " choice
+                    
+                    # 5. 校验并获取完整路径
+                    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$i" ]; then
+                        # 数组下标从0开始，所以要减1
+                        backup_file="${files[$((choice-1))]}"
+                        echo -e "已选择: ${GREEN}$backup_file${NC}"
+                    else
+                        echo -e "${RED}无效的编号${NC}"
+                        pause_prompt
+                        continue
+                    fi
                 fi
 
+                # === 执行还原 ===
                 if [ -f "$backup_file" ]; then
-                    read -p "请输入要还原到的目标域名: " target_domain
-                    read -p "确认还原? (yes/no): " confirm
-                    if [ "$confirm" == "yes" ]; then
-                        perform_restore_logic "$backup_file" "$target_domain"
-                    fi
+                    ls -1 "$SITES_DIR"
+                    echo "--------------------------------"
+                    read -p "请输入要还原到的【目标域名】: " target_domain
+                    if [ -z "$target_domain" ]; then echo "域名不能为空"; pause_prompt; continue; fi
+                    
+                    perform_restore_logic "$backup_file" "$target_domain"
                 else
-                    echo "文件未找到"
+                    echo -e "${RED}错误：文件未找到 ($backup_file)${NC}"
                 fi
+                
+                # 如果是云端下载的临时文件，还原后清理
                 [ "$src" == "2" ] && rm -f "$backup_file"
                 pause_prompt
                 ;;
@@ -3141,13 +3786,13 @@ function db_admin_tool() {
 function show_menu() {
     clear
     echo -e "${GREEN}=== Docker 智能部署系统 ($VERSION) ===${NC}"
-    echo -e "${RED}=== 仅供个人使用，请勿用于生产 ===${NC}" 
+    echo -e "${RED}=== 仅供个人使用，请勿用于生产环境 ===${NC}" 
 	echo "----------------------------------------------------------------"
     
     # --- 1. 部署中心 ---
     echo -e "${YELLOW}[🚀 部署中心]${NC}"
-    echo -e " 1. 部署 WordPress             2. 部署 反向代理"
-    echo -e " 3. 部署 301 重定向            4. ${GREEN}应用商店 (App Store)${NC}"
+    echo -e " 1. 新建 WordPress             2.新建 反向代理"
+    echo -e " 3. 新建 301 重定向            4. ${GREEN}应用商店 (App Store)${NC}"
     
     echo "" 
     
@@ -3157,14 +3802,15 @@ function show_menu() {
     echo -e " 12. 删除指定站点              13. 更新应用/站点"
     echo -e " 14. 流量统计 (GoAccess)       15. 组件版本升降级"
     echo -e " 16. 更换网站域名              17. 系统清理 (证书/垃圾)"
-    echo -e " 18. 管理站点备注              19. 自启检测和 (Swap/BBR)"
+    echo -e " 18. 管理站点备注              19. 自启检测/ip/Swap/BBR"
     
     echo ""
     
     # --- 3. 数据与工具 ---
     echo -e "${YELLOW}[💾 数据与工具]${NC}"
-    echo -e " 20. WP-CLI 瑞士军刀           21. 备份/还原 (云端)"
+    echo -e " 20. WP-CLI                      21. 备份/还原 (云端)"
     echo -e " 22. 数据库管理 (Adminer)      23. 数据库 导入/导出 (CLI)"
+	echo -e " 24. 宿主机应用穿透"
     
     echo ""
 
@@ -3173,7 +3819,8 @@ function show_menu() {
     echo -e " 30. 安全防御中心 (WAF)        31. Telegram 通知"
     echo -e " 32. 系统资源监控              33. 脚本操作日志"
     # === 新增下面这一行 ===
-    echo -e " 34. 容器日志 (找密码)         35. ${GREEN}SSH 密钥管理${NC}" 
+    echo -e " 34. 容器日志 (找密码)         35. SSH 密钥管理"
+	echo -e " 36. 网站二级密码锁"
     echo -e " 99. 重建核心网关"
 
 
@@ -3250,12 +3897,14 @@ while true; do
         21) backup_restore_ops;; 
         22) db_admin_tool;;
         23) db_manager;;
+		24) socat_manager;;
         30) security_center;; 
         31) telegram_manager;; 
         32) sys_monitor;; 
         33) log_manager;; 
         34) view_container_logs;;
         35) ssh_key_manager;;
+		36) add_basic_auth;;
         99) rebuild_gateway_action;;
         u|U) update_script;; 
         x|X) uninstall_cluster;; 
@@ -3263,4 +3912,3 @@ while true; do
         *) echo "无效选项"; sleep 1;;
     esac
 done
-
