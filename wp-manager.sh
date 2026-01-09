@@ -2,7 +2,7 @@
 
 # ================= 1. 配置区域 =================
 # 脚本版本号
-VERSION="V10.3.5(快捷方式: mmp)"
+VERSION="V10.41(快捷方式: mmp)"
 DOCKER_COMPOSE_CMD="docker compose"
 
 # 数据存储路径
@@ -401,34 +401,58 @@ EOF
 chmod +x "$LISTENER_SCRIPT"
 }
 
-# === [修复版] 强制刷新网关配置 (带延迟等待) ===
+# === [完美版] 智能网关刷新 (双重重载机制) ===
 function reload_gateway_config() {
+    local target_domain=$1
     echo -e "${YELLOW}>>> 正在同步网关配置...${NC}"
+
+    # 1. 【第一阶段】立即平滑重载
+    # 目的：让 Nginx 识别新域名，打通 HTTP (80) 端口
+    # 只有这一步成功了，Let's Encrypt 的验证请求才能进来
+    if docker ps | grep -q "gateway_proxy"; then
+        docker exec gateway_proxy nginx -s reload >/dev/null 2>&1
+        echo -e "${GREEN}✔ 阶段一: 路由表已更新 (HTTP已通，准备接收证书)${NC}"
+    else
+        echo -e "${RED}❌ 网关未运行${NC}"; return
+    fi
+
+    # 如果没有传入域名（只是普通刷新），到这就结束了
+    if [ -z "$target_domain" ]; then return; fi
+
+    # 2. 【第二阶段】等待证书生成
+    # 只有新站点才需要这一步。脚本会挂起等待，直到证书文件出现在网关容器里。
+    echo -e "${YELLOW}>>> 正在等待 SSL 证书签发 (可能需要 15-60 秒)...${NC}"
+    echo -n "   Waiting"
     
-    # 1. 【核心修复】强制等待 5 秒
-    # 让新启动的容器有足够的时间完成网络注册和 IP 分配
-    # 否则网关重启太快，会读不到新容器的 IP，导致 502 或 404
-    echo -n "   等待新容器网络就绪 (5秒)..."
-    for i in {1..5}; do 
+    local max_wait=90  # 最大等待 90 秒
+    local cert_found=0
+
+    for ((i=1; i<=max_wait; i++)); do
+        # 检查网关容器内是否存在该域名的 .crt 文件
+        if docker exec gateway_proxy test -f "/etc/nginx/certs/${target_domain}.crt"; then
+            cert_found=1
+            echo -e "\n${GREEN}✔ 证书已生成！${NC}"
+            break
+        fi
         echo -n "."
         sleep 1
     done
-    echo ""
 
-    if docker ps | grep -q "gateway_proxy"; then
-        # 2. 强制重启网关
-        # Restart 比 reload 更彻底，它会强制 nginx-proxy 重新扫描整个 Docker 网络
+    if [ $cert_found -eq 0 ]; then
+        echo -e "\n${RED}⚠️  等待超时：证书尚未就绪。${NC}"
+        echo -e "原因可能是：DNS解析未生效、Cloudflare未开启DNS Only、或申请频率受限。"
+        echo -e "但这不影响网站运行，稍后证书生成后会自动生效。"
+    else
+        # 3. 【第三阶段】证书就绪，执行终极重启
+        echo -e "${YELLOW}>>> 正在加载 SSL 安全配置...${NC}"
+        
+        # 这里使用 restart 而不是 reload，确保端口监听状态彻底切换
         docker restart gateway_proxy >/dev/null 2>&1
         
-        # 3. 连带重启 ACME
-        # 网关重启后，ACME 容器有时会断开 Socket 连接，顺手重启它最稳妥
-        if docker ps | grep -q "gateway_acme"; then
-             docker restart gateway_acme >/dev/null 2>&1
-        fi
+        # 顺手重启 ACME 保持连接活跃
+        docker restart gateway_acme >/dev/null 2>&1
         
-        echo -e "${GREEN}✔ 网关已重启，新站点路由已生效${NC}"
-    else
-        echo -e "${RED}⚠️  警告: 网关容器未运行，跳过刷新${NC}"
+        echo -e "${GREEN}✔ 阶段二: HTTPS 已全绿开启 (完美启动)${NC}"
     fi
 }
 
@@ -2053,7 +2077,7 @@ function traffic_manager() {
         echo -e "${YELLOW}>>> 正在测试 Nginx 配置...${NC}"
         # 预检配置
         if docker exec gateway_proxy nginx -t >/dev/null 2>&1; then
-            reload_gateway_config # 调用之前修复过的带等待的重启函数
+            reload_gateway_config
             echo -e "${GREEN}✔ 配置生效${NC}"
         else
             echo -e "${RED}❌ 配置有误，Nginx 拒绝加载！${NC}"
@@ -2877,7 +2901,7 @@ EOF
     # 5. 启动容器
     echo -e "${GREEN}>>> 正在启动容器...${NC}"
     $DOCKER_COMPOSE_CMD -f "$sdir/docker-compose.yml" up -d
-    reload_gateway_config
+    reload_gateway_config "$fd"
     
     check_ssl_status "$fd"
     write_log "Created site $fd (PHP:$pt DB:$di Redis:$rt)"
@@ -2990,7 +3014,46 @@ EOF
     check_ssl_status "$s"
 }
 
-function delete_site() { while true; do clear; echo "=== 🗑️ 删除网站 ==="; ls -1 "$SITES_DIR"; echo "----------------"; read -p "域名(0返回): " d; [ "$d" == "0" ] && return; if [ -d "$SITES_DIR/$d" ]; then read -p "确认? (y/n): " c; [ "$c" == "y" ] && cd "$SITES_DIR/$d" && docker compose down -v >/dev/null 2>&1 && cd .. && rm -rf "$SITES_DIR/$d" && echo "Deleted"; write_log "Deleted site $d"; fi; pause_prompt; done; }
+function delete_site() { 
+    while true; do 
+        clear
+        echo -e "${RED}=== 🗑️ 删除网站 (Delete Site) ===${NC}"
+        ls -1 "$SITES_DIR"
+        echo "----------------"
+        read -p "请输入要删除的域名 (0返回): " d
+        [ "$d" == "0" ] && return
+        
+        if [ -d "$SITES_DIR/$d" ]; then 
+            echo -e "${RED}⚠️  警告: 此操作将永久删除 [$d] 的所有文件和数据库！${NC}"
+            read -p "确认彻底删除? (输入 yes 确认): " confirm
+            
+            if [ "$confirm" == "yes" ]; then
+                echo -e "${YELLOW}>>> [1/4] 正在停止容器...${NC}"
+                cd "$SITES_DIR/$d" && docker compose down -v >/dev/null 2>&1
+                
+                echo -e "${YELLOW}>>> [2/4] 正在删除文件...${NC}"
+                cd .. && rm -rf "$SITES_DIR/$d"
+                
+                echo -e "${YELLOW}>>> [3/4] 正在清理 SSL 证书残留...${NC}"
+                # 顺手把证书删了，防止重建时冲突
+                docker exec gateway_acme rm -f "/etc/nginx/certs/$d.crt" "/etc/nginx/certs/$d.key" >/dev/null 2>&1
+                docker exec gateway_acme rm -rf "/etc/acme.sh/$d" >/dev/null 2>&1
+                
+                echo -e "${YELLOW}>>> [4/4] 正在更新网关路由...${NC}"
+                # 【关键】这里调用刷新函数，不需要传参数，只是为了重载配置去掉死链
+                reload_gateway_config
+                
+                write_log "Deleted site $d"
+                echo -e "${GREEN}✔ 站点已彻底删除。${NC}"
+            else
+                echo "操作已取消。"
+            fi
+        else
+            echo -e "${RED}❌ 目录不存在。${NC}"
+        fi
+        pause_prompt
+    done 
+}
 
 function list_sites() {
     clear
