@@ -2780,7 +2780,7 @@ max_execution_time = 300
 max_input_time = 300
 post_max_size = 512M
 upload_max_filesize = 512M
-max_file_uploads = 20
+max_file_uploads = 90
 
 ; === 远程包含防御 (防RFI) ===
 allow_url_fopen = On
